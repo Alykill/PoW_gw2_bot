@@ -9,6 +9,14 @@ GLOBAL_PLAYER_METRICS = [
 ]
 
 ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
+    "vale guardian": [
+        {"key": "Boss TP", "label": "Blue ports",
+         "exact": ["Boss TP", "Boss Teleport"], "modes": ["occurrences"]},
+    ],
+    "gorseval the multifarious": [
+        {"key": "Egg", "label": "Eggs",
+         "exact": ["Egg", "Egged"], "modes": ["occurrences", "occurrences"]},
+    ],
     "dhuum": [
         {"key": "dhuum_dip", "label": "Dip AoE (Lesser Death Mark hits)",
          "exact": ["Dip", "Dip AoE"], "modes": ["occurrences"]},
@@ -22,7 +30,6 @@ ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
          "exact": ["S.Lght.H", "Small Lightning Hit"], "modes": ["occurrences"]},
         {"key": "qtp_magma", "label": "Magma.F (Magma Field)",
          "exact": ["Magma.F", "Magma Field"], "modes": ["occurrences"]},
-        # This one should show both counts:
         {"key": "qtp_small_magma", "label": "S.Magma.F (Small Magma Field)",
          "exact": ["S.Magma.F", "Small Magma Field"], "modes": ["occurrences", "hits"]},
     ],
