@@ -5,7 +5,7 @@ import os
 import json
 import aiohttp
 import aiosqlite
-from typing import Dict, List, Tuple, Any, DefaultDict, Union
+from typing import Dict, List, Tuple, Any, DefaultDict, Union, Optional
 from collections import defaultdict
 import discord
 
@@ -57,7 +57,6 @@ def _get_from_maybe_list(obj: Any, *keys, default=0):
       - a list of dicts (return the first non-missing value).
     Returns default if missing / unparsable.
     """
-    # dict case
     if isinstance(obj, dict):
         for k in keys:
             if k in obj and obj[k] is not None:
@@ -69,7 +68,6 @@ def _get_from_maybe_list(obj: Any, *keys, default=0):
                     except Exception:
                         return default
         return default
-    # list[dict] case
     if isinstance(obj, list):
         for el in obj:
             if isinstance(el, dict):
@@ -80,7 +78,6 @@ def _get_from_maybe_list(obj: Any, *keys, default=0):
     return default
 
 def _player_downs(p: Dict[str, Any]) -> int:
-    # EI: defenses can be dict OR list[dict]; keys vary by EI version
     defenses = p.get("defenses")
     return int(_get_from_maybe_list(defenses, "downCount", "downs", "downed", "downedCount", default=0))
 
@@ -89,7 +86,6 @@ def _player_deaths(p: Dict[str, Any]) -> int:
     return int(_get_from_maybe_list(defenses, "deadCount", "deaths", default=0))
 
 def _player_resurrects(p: Dict[str, Any]) -> int:
-    # EI: support can be dict OR list[dict]
     support = p.get("support")
     return int(_get_from_maybe_list(support, "resurrects", "resurrectsPerformed", default=0))
 
@@ -119,47 +115,180 @@ def _player_boss_dps(p: Dict[str, Any]) -> float:
         pass
     return 0.0
 
-def _match_text(s: str, needles: List[str]) -> bool:
-    ls = (s or "").lower()
-    return any(n in ls for n in needles)
+from typing import Optional
 
-def _collect_mechanic_counts(j: Dict[str, Any], matchers: List[str]) -> Dict[str, int]:
+from typing import Optional, Tuple
+
+def _collect_mechanic_counts(
+    j: Dict[str, Any],
+    substrings: List[str],
+    exact_names: Optional[List[str]] = None,
+    canonical: Optional[str] = None,
+    dedup_ms: Optional[int] = None,
+) -> Dict[str, int]:
     """
-    Returns {actor -> count} for mechanics whose name/desc matches any matcher.
-    EI shapes vary; be defensive about non-dict / non-list entries.
+    Return {account -> count} for a given mechanic spec.
+
+    Matching: exact (preferred) or substring fallback.
+    Priority:
+      1) mechanics[*].players / playerHits (EI aggregated)
+      2) mechanics[*].mechanicsData (per hit, dedup across entries using canonical key; optional time tolerance)
+      3) top-level mechanic logs (rare fallback; same dedup)
+    Dedup applies ONLY across different mechanic entries (not within the same entry).
     """
-    per_actor: DefaultDict[str, int] = defaultdict(int)
 
-    mechs = j.get("mechanics") or []
-    if not isinstance(mechs, list):
-        return {}
-
-    for m in mechs:
-        if not isinstance(m, dict):
-            continue
-        texts = [
+    def _texts(m: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
+        return (
             str(m.get("name") or ""),
+            str(m.get("shortName") or ""),
             str(m.get("fullName") or ""),
             str(m.get("description") or ""),
             str(m.get("tooltip") or ""),
-        ]
-        if not any(_match_text(t, matchers) for t in texts):
-            continue
+        )
 
-        players_list = m.get("players") or []
-        if not isinstance(players_list, list):
+    def _match(m: Dict[str, Any]) -> bool:
+        name, short, full, desc, tip = _texts(m)
+        if exact_names:
+            lowers = {t.strip().lower() for t in (name, short, full) if t}
+            exacts = {e.strip().lower() for e in exact_names if e}
+            return bool(lowers & exacts)
+        lows = [t.lower() for t in (name, short, full, desc, tip) if t]
+        needles = [s.lower() for s in (substrings or []) if s]
+        return any(any(n in t for t in lows) for n in needles)
+
+    canon_key = (canonical or (",".join((exact_names or substrings or ["mechanic"])))).strip().lower()
+
+    per_actor: DefaultDict[str, int] = defaultdict(int)
+
+    # Map character -> account
+    name_to_account: Dict[str, str] = {}
+    for pl in (j.get("players") or []):
+        if isinstance(pl, dict):
+            ch = pl.get("name"); acct = pl.get("account")
+            if ch and acct:
+                name_to_account[str(ch)] = str(acct)
+
+    mechanics = j.get("mechanics") or []
+
+    # ---- 1) Prefer EI aggregated counts ----
+    used_agg = False
+    for m in mechanics:
+        if not isinstance(m, dict) or not _match(m):
             continue
-        for rec in players_list:
+        players_list = m.get("players") or m.get("playerHits")
+        if isinstance(players_list, list) and players_list:
+            used_agg = True
+            for rec in players_list:
+                if not isinstance(rec, dict):
+                    continue
+                account = rec.get("account")
+                if not account:
+                    account = name_to_account.get(str(rec.get("name") or rec.get("actor") or ""))
+                if not account:
+                    continue
+                c = rec.get("c", rec.get("count", 1))
+                try: c = int(c)
+                except Exception: c = 1
+                if c > 0:
+                    per_actor[str(account)] += c
+    if used_agg:
+        return dict(per_actor)
+
+    # Helper: cross-entry dedup
+    # For each (account, canon_key) keep a list of (ms, entry_index) we've already counted.
+    seen_by_actor: Dict[Tuple[str, str], List[Tuple[int, int]]] = defaultdict(list)
+
+    def _already_seen(account: str, ms: Optional[int], entry_idx: int) -> bool:
+        if ms is None:
+            return False
+        lst = seen_by_actor[(account, canon_key)]
+        # cross-entry dedup: allow same-entry duplicates, suppress different-entry duplicates
+        for prev_ms, prev_idx in lst:
+            if prev_idx == entry_idx:
+                continue  # same entry → keep (don’t dedup)
+            if dedup_ms is None:
+                if prev_ms == ms:
+                    return True
+            else:
+                if abs(prev_ms - ms) <= dedup_ms:
+                    return True
+        return False
+
+    def _mark_seen(account: str, ms: Optional[int], entry_idx: int):
+        if ms is None:
+            return
+        seen_by_actor[(account, canon_key)].append((ms, entry_idx))
+
+    # ---- 2) mechanics[*].mechanicsData ----
+    for idx, m in enumerate(mechanics):
+        if not isinstance(m, dict) or not _match(m):
+            continue
+        md = m.get("mechanicsData")
+        if not (isinstance(md, list) and md):
+            continue
+        for rec in md:
             if not isinstance(rec, dict):
                 continue
-            actor = rec.get("account") or rec.get("name") or "Unknown"
-            c = int(rec.get("c", rec.get("count", 0)) or 0)
-            if c > 0:
-                per_actor[actor] += c
+            actor_char = rec.get("actor") or rec.get("name")
+            account = name_to_account.get(str(actor_char)) if actor_char else None
+            if not account:
+                continue
+            t = rec.get("time")
+            try:
+                ms = int(t) if t is not None else None
+            except Exception:
+                ms = None
+            if _already_seen(account, ms, idx):
+                continue
+            _mark_seen(account, ms, idx)
+            per_actor[str(account)] += 1
+
+    if per_actor:
+        return dict(per_actor)
+
+    # ---- 3) Fallback: top-level logs ----
+    log_candidates: List[List[Dict[str, Any]]] = []
+    for k in ("mechanicLogs", "mechanicsLogs", "mechanicsLog", "mechanicsEvents", "mechLogs"):
+        v = j.get(k)
+        if isinstance(v, list) and v:
+            log_candidates.append(v)
+    for k in ("mechanicLogsById", "mechanicsById", "mechData"):
+        v = j.get(k)
+        if isinstance(v, dict) and v:
+            for vv in v.values():
+                if isinstance(vv, list) and vv:
+                    log_candidates.append(vv)
+
+    for idx, logs in enumerate(log_candidates):
+        for rec in logs:
+            if not isinstance(rec, dict):
+                continue
+            pseudo = {
+                "name": rec.get("mechanic") or rec.get("name"),
+                "shortName": rec.get("shortName"),
+                "fullName": rec.get("fullName"),
+                "description": rec.get("description"),
+                "tooltip": rec.get("tooltip"),
+            }
+            if not _match(pseudo):
+                continue
+            actor_char = rec.get("actor") or rec.get("name") or rec.get("source")
+            account = name_to_account.get(str(actor_char)) if actor_char else None
+            if not account:
+                continue
+            t = rec.get("time")
+            try:
+                ms = int(t) if t is not None else None
+            except Exception:
+                ms = None
+            if _already_seen(account, ms, idx):
+                continue
+            _mark_seen(account, ms, idx)
+            per_actor[str(account)] += 1
 
     return dict(per_actor)
 
-# ---------- Payload normalization (permali﻿nk/file -> EI dict) ----------
+# ---------- Payload normalization (permalink/file -> EI dict) ----------
 async def _coerce_payload_to_json(payload: Union[dict, str]) -> Dict[str, Any]:
     """
     Accepts:
@@ -167,25 +296,19 @@ async def _coerce_payload_to_json(payload: Union[dict, str]) -> Dict[str, Any]:
       - str: local JSON path OR dps.report permalink (we try several endpoints)
     Returns a parsed EI JSON dict.
     """
-    # Already a dict?
     if isinstance(payload, dict):
-        # If this already looks like EI, use it:
         if isinstance(payload.get("players"), list):
             return payload
-        # If it looks like an upload response with a permalink, follow it:
         link = payload.get("permalink") or payload.get("permaLink") or payload.get("id")
         if isinstance(link, str) and link:
             return await _coerce_payload_to_json(link)
-        # Otherwise return as-is; caller will validate/raise if needed.
         return payload
 
-    # Must be a string now
     if not isinstance(payload, str):
         raise TypeError("payload must be dict or str (url or file path)")
 
     s = payload.strip()
 
-    # Local JSON file?
     if os.path.isfile(s):
         with open(s, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -193,18 +316,12 @@ async def _coerce_payload_to_json(payload: Union[dict, str]) -> Dict[str, Any]:
                 raise ValueError(f"Local JSON was {type(data).__name__}, expected object")
             return data
 
-    # URL → try known EI JSON endpoints
     if s.startswith("http://") or s.startswith("https://"):
         base = s.rstrip("/")
-        if base.lower().endswith(".json"):
-            candidates = [base]
-        else:
-            candidates = [
-                base + "/ei.json",
-                base + "/json",
-                base + "/report.json",
-                base + "/index.json",
-            ]
+        candidates = (
+            [base] if base.lower().endswith(".json")
+            else [base + p for p in ("/ei.json", "/json", "/report.json", "/index.json")]
+        )
 
         timeout = aiohttp.ClientTimeout(total=30)
         headers = {"User-Agent": "Mozilla/5.0 (compatible; gw2-raidbot/1.0)"}
@@ -216,8 +333,7 @@ async def _coerce_payload_to_json(payload: Union[dict, str]) -> Dict[str, Any]:
                         if resp.status != 200:
                             last_err = RuntimeError(f"{url} => HTTP {resp.status}")
                             continue
-                        # EI sometimes serves text/plain
-                        text = await resp.text()
+                        text = await resp.text()  # EI sometimes serves text/plain
                         data = json.loads(text)
                         if isinstance(data, dict) and isinstance(data.get("players"), list):
                             return data
@@ -263,7 +379,13 @@ async def enrich_upload(upload_id: int, payload: Union[dict, str]):
     for key, specs in ENCOUNTER_MECHANICS.items():
         if key in b_lower:
             for spec in specs:
-                counts = _collect_mechanic_counts(upload_json, spec["match"])
+                counts = _collect_mechanic_counts(
+                    upload_json,
+                    substrings=spec.get("match", []),
+                    exact_names=spec.get("exact"),
+                    canonical=spec.get("canonical"),
+                    dedup_ms=spec.get("dedup_ms"),
+                )
                 for actor, cnt in counts.items():
                     rows.append((upload_id, actor, spec["key"], float(cnt)))
 
@@ -312,8 +434,7 @@ async def build_event_metrics(event_name: str) -> Dict[str, Any]:
                     (upload_id, key),
                 )
                 for actor, v in await cur.fetchall():
-                    overall = float(v or 0)
-                    agg[actor] += overall
+                    agg[actor] += float(v or 0)
 
             # Top DPS per encounter
             cur = await db.execute(
@@ -392,11 +513,14 @@ async def build_event_analytics_embeds(event_name: str) -> List[discord.Embed]:
     enc_spec = data.get("encounter_specific", {})
     for enc_name, rows in enc_spec.items():
         by_label: DefaultDict[str, List[Tuple[str, float]]] = defaultdict(list)
+        totals: DefaultDict[str, int] = defaultdict(int)
         for label, actor, v in rows:
             by_label[label].append((actor, v))
+            totals[label] += int(v)
+
         em2 = discord.Embed(title=f"🧩 Encounter Mechanics — {enc_name}", color=discord.Color.blurple())
-        for label, arr in by_label.items():
-            arr_sorted = sorted(arr, key=lambda x: (-x[1], x[0].lower()))
+        for label in sorted(by_label.keys(), key=lambda k: -totals[k]):
+            arr_sorted = sorted(by_label[label], key=lambda x: (-x[1], x[0].lower()))
             em2.add_field(name=label, value=_fmt_table(arr_sorted, limit=10), inline=False)
         embeds.append(em2)
 
