@@ -8,6 +8,8 @@ import aiosqlite
 from typing import Dict, List, Tuple, Any, DefaultDict, Union, Optional
 from collections import defaultdict
 import discord
+import re
+import asyncio
 
 from .registry import ENCOUNTER_MECHANICS
 
@@ -114,8 +116,6 @@ def _player_boss_dps(p: Dict[str, Any]) -> float:
     except Exception:
         pass
     return 0.0
-
-from typing import Optional
 
 from typing import Optional, Tuple
 
@@ -318,28 +318,58 @@ async def _coerce_payload_to_json(payload: Union[dict, str]) -> Dict[str, Any]:
 
     if s.startswith("http://") or s.startswith("https://"):
         base = s.rstrip("/")
-        candidates = (
-            [base] if base.lower().endswith(".json")
-            else [base + p for p in ("/ei.json", "/json", "/report.json", "/index.json")]
-        )
+
+        # extract permalink id if present
+        m = re.search(r"dps\.report/([^/?#]+)", base)
+        permalink_id = m.group(1) if m else None
+
+        # build endpoint candidates
+        if base.lower().endswith(".json"):
+            base_candidates = [base]
+        else:
+            base_candidates = []
+            if permalink_id:
+                base_candidates.append(f"https://dps.report/getJson?permalink={permalink_id}")  # try this first
+            base_candidates += [
+                base + "/ei.json",
+                base + "/json",
+                base + "/report.json",
+                base + "/index.json",
+            ]
 
         timeout = aiohttp.ClientTimeout(total=30)
         headers = {"User-Agent": "Mozilla/5.0 (compatible; gw2-raidbot/1.0)"}
+
+        # retry a few times because EI JSON may not be ready right after upload
+        attempts = 5
+        backoff = 1.5  # seconds, exponential
+
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as sess:
             last_err: Exception | None = None
-            for url in candidates:
-                try:
-                    async with sess.get(url, allow_redirects=True) as resp:
-                        if resp.status != 200:
-                            last_err = RuntimeError(f"{url} => HTTP {resp.status}")
-                            continue
-                        text = await resp.text()  # EI sometimes serves text/plain
-                        data = json.loads(text)
-                        if isinstance(data, dict) and isinstance(data.get("players"), list):
-                            return data
-                        last_err = ValueError(f"{url} returned {type(data).__name__}, not EI object")
-                except Exception as e:
-                    last_err = e
+            for attempt in range(1, attempts + 1):
+                for url in base_candidates:
+                    try:
+                        async with sess.get(url, allow_redirects=True) as resp:
+                            if resp.status != 200:
+                                last_err = RuntimeError(f"{url} => HTTP {resp.status}")
+                                continue
+                            text = await resp.text()
+                            data = json.loads(text)
+                            if isinstance(data, dict) and isinstance(data.get("players"), list):
+                                return data
+                            # some getJson responses wrap in a list; accept first dict-like
+                            if isinstance(data, list):
+                                for el in data:
+                                    if isinstance(el, dict) and isinstance(el.get("players"), list):
+                                        return el
+                            last_err = ValueError(f"{url} returned unusable JSON shape")
+                    except Exception as e:
+                        last_err = e
+                        continue
+
+                if attempt < attempts:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
             raise last_err or ValueError("No valid EI JSON endpoint returned an object")
 
     raise ValueError("payload string was neither a readable file nor a valid URL")
@@ -494,6 +524,44 @@ def _fmt_top_dps(rows: List[Tuple[str, str, float]], limit: int = 10) -> str:
     if not rows:
         return "_No data_"
     return "\n".join(f"• **{boss}** — **{actor}** ({int(dps)} DPS)" for boss, actor, dps in rows[:limit])
+
+# put near the bottom of service.py
+async def ensure_enriched_for_event(event_name: str) -> int:
+    """
+    Re-enrich any uploads for this event that have no metrics yet.
+    Returns the number of uploads that were (re)processed.
+    """
+    await _ensure_tables()
+    repaired = 0
+    async with aiosqlite.connect("events.db") as db:
+        # find uploads with zero metrics
+        cur = await db.execute(
+            """
+            SELECT u.id, COALESCE(NULLIF(u.permalink, ''), u.file_path) AS src
+            FROM uploads u
+            LEFT JOIN (
+              SELECT upload_id, COUNT(*) AS cnt
+              FROM metrics
+              GROUP BY upload_id
+            ) m ON m.upload_id = u.id
+            WHERE u.event_name = ?
+              AND (m.cnt IS NULL OR m.cnt = 0)
+            ORDER BY datetime(u.time_utc) ASC
+            """,
+            (event_name,),
+        )
+        rows = await cur.fetchall()
+
+    for upload_id, src in rows:
+        try:
+            # src can be a permalink or a path (our coerce handles both)
+            await enrich_upload(upload_id, src)
+            repaired += 1
+        except Exception:
+            # don't explode the whole pass; just skip this one
+            pass
+
+    return repaired
 
 async def build_event_analytics_embeds(event_name: str) -> List[discord.Embed]:
     data = await build_event_metrics(event_name)

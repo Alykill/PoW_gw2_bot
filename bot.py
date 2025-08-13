@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 import json
 
 # ✅ Analytics imports
-from analytics.service import enrich_upload, build_event_analytics_embeds
+from analytics.service import (ensure_enriched_for_event, build_event_analytics_embeds)
 
 load_dotenv()
 
@@ -745,6 +745,11 @@ async def end_event(name, channel_id):
             await ch.send(f"✅ **Event '{name}'** has ended. Processing logs and generating summary...")
             await ch.send(embed=summary_embed)
 
+            # ✅ Ensure all uploads for this event are enriched before analytics
+            repaired = await ensure_enriched_for_event(name)
+            if repaired:
+                print(f"[WATCH] Repaired {repaired} missing analytics uploads for {name}")
+
             # Auto-post analytics for the event
             try:
                 embeds = await build_event_analytics_embeds(name)
@@ -759,6 +764,12 @@ async def end_event(name, channel_id):
     # Fallback if no session
     if ch:
         await ch.send(f"✅ **Event '{name}'** has ended. (No logs collected or LOG_DIR not set.)")
+
+        # 🔧 Make sure uploads for this event are enriched before analytics
+        repaired = await ensure_enriched_for_event(name)
+        if repaired:
+            print(f"[WATCH] Repaired {repaired} missing analytics uploads for {name}")
+
         # Still try to post analytics if available
         try:
             embeds = await build_event_analytics_embeds(name)
