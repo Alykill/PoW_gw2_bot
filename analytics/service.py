@@ -525,6 +525,29 @@ def _fmt_top_dps(rows: List[Tuple[str, str, float]], limit: int = 10) -> str:
         return "_No data_"
     return "\n".join(f"• **{boss}** — **{actor}** ({int(dps)} DPS)" for boss, actor, dps in rows[:limit])
 
+def _add_multicol_fields(
+    em: discord.Embed,
+    lines: List[str],
+    max_cols: int = 3,
+    field_name: str = "\u200b",
+) -> None:
+    """
+    Add the given list of lines to the embed as up to `max_cols` inline fields,
+    balancing items per column.
+    """
+    if not lines:
+        em.add_field(name=field_name, value="_No data_", inline=True)
+        return
+
+    n = len(lines)
+    cols = max_cols if n >= 9 else (2 if n >= 4 else 1)
+    per_col = (n + cols - 1) // cols  # ceiling
+    for i in range(cols):
+        chunk = lines[i * per_col : (i + 1) * per_col]
+        if not chunk:
+            continue
+        em.add_field(name=field_name, value="\n".join(chunk), inline=True)
+
 # put near the bottom of service.py
 async def ensure_enriched_for_event(event_name: str) -> int:
     """
@@ -571,10 +594,32 @@ async def build_event_analytics_embeds(event_name: str) -> List[discord.Embed]:
     embeds: List[discord.Embed] = []
 
     em = discord.Embed(title=f"📈 Analytics — {event_name}", color=discord.Color.purple())
-    em.add_field(name="Times downed (Top 10)", value=_fmt_table(data.get("overall_downs", [])), inline=False)
-    em.add_field(name="Times died (Top 10)", value=_fmt_table(data.get("overall_deaths", [])), inline=False)
-    em.add_field(name="Resurrects (Top 10)", value=_fmt_table(data.get("overall_resurrects", [])), inline=False)
-    em.add_field(name="Top DPS per encounter", value=_fmt_top_dps(data.get("top_boss_dps", []), limit=25), inline=False)
+
+    # Three compact columns: downs / deaths / res
+    em.add_field(
+        name="Times downed (Top 10)",
+        value=_fmt_table(data.get("overall_downs", [])),
+        inline=True,  # 👈 column
+    )
+    em.add_field(
+        name="Times died (Top 10)",
+        value=_fmt_table(data.get("overall_deaths", [])),
+        inline=True,  # 👈 column
+    )
+    em.add_field(
+        name="Resurrects (Top 10)",
+        value=_fmt_table(data.get("overall_resurrects", [])),
+        inline=True,  # 👈 column
+    )
+
+    # Top DPS per encounter — split across columns (2–3) if long
+    top_dps_rows = data.get("top_boss_dps", [])
+    if top_dps_rows:
+        dps_lines = [f"• **{boss}** — **{actor}** ({int(dps)} DPS)" for boss, actor, dps in top_dps_rows[:25]]
+        em.add_field(name="\u200b", value="\u200b", inline=False)  # spacer
+        em.add_field(name="Top DPS per encounter", value="\u200b", inline=False)
+        _add_multicol_fields(em, dps_lines, max_cols=3)
+
     em.set_footer(text="Metrics from dps.report / Elite Insights JSON")
     embeds.append(em)
 
@@ -587,9 +632,19 @@ async def build_event_analytics_embeds(event_name: str) -> List[discord.Embed]:
             totals[label] += int(v)
 
         em2 = discord.Embed(title=f"🧩 Encounter Mechanics — {enc_name}", color=discord.Color.blurple())
-        for label in sorted(by_label.keys(), key=lambda k: -totals[k]):
+
+        # Sort labels by total desc
+        labels_sorted = sorted(by_label.keys(), key=lambda k: -totals[k])
+
+        # Render each mechanic label as an inline field (Discord will flow them into up to 3 columns)
+        for label in labels_sorted:
             arr_sorted = sorted(by_label[label], key=lambda x: (-x[1], x[0].lower()))
-            em2.add_field(name=label, value=_fmt_table(arr_sorted, limit=10), inline=False)
+            em2.add_field(
+                name=label,
+                value=_fmt_table(arr_sorted, limit=10),
+                inline=True,  # 👈 columnized per label
+            )
+
         embeds.append(em2)
 
     return embeds

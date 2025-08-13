@@ -14,7 +14,11 @@ from dotenv import load_dotenv
 import json
 
 # ✅ Analytics imports
-from analytics.service import (ensure_enriched_for_event, build_event_analytics_embeds)
+from analytics.service import (
+    enrich_upload,                 # <-- added
+    ensure_enriched_for_event,
+    build_event_analytics_embeds,
+)
 
 load_dotenv()
 
@@ -569,7 +573,7 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
         super().__init__(timeout=None)
         self.name_input = discord.ui.TextInput(label="Event name", placeholder="Raid Full Clear", required=True, max_length=100)
         self.start_input = discord.ui.TextInput(label="Start (YYYY-MM-DD HH:MM)", placeholder="2025-08-12 18:00", required=True)
-        self.duration_input = discord.ui.TextInput(label="Duration (e.g., 2h30m, 45m, 3h)", placeholder="2h30m", required=True)
+        self.duration_input = discord.ui.TextInput(label="Duration (e.g., 2h30m, 45m)", placeholder="2h30m", required=True)
         self.channel_input = discord.ui.TextInput(label="Channel (mention, ID, or name)", placeholder="#raid-planning or 123456789012345678", required=False)
         self.add_item(self.name_input)
         self.add_item(self.start_input)
@@ -637,7 +641,7 @@ class SignupView(discord.ui.View):
             scheduler.add_job(send_dm_reminder, 'date', id=job_id, replace_existing=True,
                               run_date=reminder_time, args=[user_id, self.event_name, self.event_start])
         else:
-            await send_dm_reminder(user_id, self.event_name, self.event_start)
+            await send_dm_reminder(user_id, self.event_start, self.event_start)
 
         await interaction.response.defer()
         await update_event_message(self.event_name, self.channel_id, self.message_id)
@@ -740,7 +744,8 @@ async def end_event(name, channel_id):
     sess = active_sessions.pop((name, channel_id), None)
     if sess:
         await sess.stop_task()
-        summary_embed = await build_summary_embed(name, sess.results)
+        log.info(f"[WATCH] {name}: collected {len(sess.results)} upload result(s)")  # 👈 debug visibility
+        summary_embed = await build_summary_embed(name, sess.results, event_start_utc=sess.start)
         if ch:
             await ch.send(f"✅ **Event '{name}'** has ended. Processing logs and generating summary...")
             await ch.send(embed=summary_embed)
@@ -780,11 +785,49 @@ async def end_event(name, channel_id):
             await ch.send(f"⚠️ Analytics failed: `{e}`")
 
 # ---------- Build summary ----------
-async def build_summary_embed(event_name: str, results: List[dict]) -> discord.Embed:
+def _parse_dt_any(s: Optional[str]) -> Optional[datetime.datetime]:
+    """Parse common dps.report timestamp shapes as aware UTC datetimes if possible."""
+    if not s:
+        return None
+    # EI typically uses ISO 8601 (UTC). We try a couple of lenient paths.
+    try:
+        # Handles "2025-08-13T11:22:33Z" or with offset
+        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc)
+    except Exception:
+        pass
+    # Fallback: try stripping ms or weird fractions
+    try:
+        base = s.split('.')[0]  # "2025-08-13T11:22:33"
+        dt = datetime.datetime.fromisoformat(base)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc)
+    except Exception:
+        return None
+
+def _fmt_td_hms(td: datetime.timedelta) -> str:
+    secs = int(td.total_seconds())
+    if secs < 0:
+        secs = 0
+    h = secs // 3600
+    m = (secs % 3600) // 60
+    s = secs % 60
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+async def build_summary_embed(event_name: str, results: List[dict], event_start_utc: Optional[datetime.datetime] = None) -> discord.Embed:
     """
-    Group attempts by encounter. If no success, show attempts + link the most recent attempt.
-    If success exists, show number of attempts until first success + link the kill.
+    Group attempts by encounter, compute Total/Wasted time, and render encounters in 1–3 columns.
+    Total time: event_start -> last log end (if available).
+    Wasted time: sum of gaps between consecutive attempts (start[i] - end[i-1], clipped at >=0).
     """
+    # Build attempt buckets per boss
     attempts: Dict[Tuple[int, str], List[dict]] = {}
     for r in results:
         enc = r.get("encounter", {}) if isinstance(r.get("encounter"), dict) else {}
@@ -793,15 +836,62 @@ async def build_summary_embed(event_name: str, results: List[dict]) -> discord.E
         key = (int(boss_id), str(boss_name))
         attempts.setdefault(key, []).append(r)
 
-    # sort attempts by end-time or fallback key
+    # Sort logs in each bucket by end (then start) so our links/readout are stable
     def sort_key(x):
-        return x.get("timeEnd") or x.get("time") or ""
+        return (x.get("timeEnd") or "", x.get("timeStart") or x.get("time") or "")
     for key in attempts:
         attempts[key].sort(key=sort_key)
 
-    lines = []
+    # Compute overall timing
+    spans: List[Tuple[Optional[datetime.datetime], Optional[datetime.datetime]]] = []
+    for logs in attempts.values():
+        for r in logs:
+            start_dt = _parse_dt_any(r.get("timeStart") or r.get("time"))
+            end_dt   = _parse_dt_any(r.get("timeEnd"))
+            spans.append((start_dt, end_dt))
+
+    # last_end for Total time
+    last_end: Optional[datetime.datetime] = None
+    for _s, e in spans:
+        if e and (last_end is None or e > last_end):
+            last_end = e
+
+    # Total time: from event_start_utc (if given), else earliest start we have, to last_end
+    earliest_start: Optional[datetime.datetime] = None
+    for s, _e in spans:
+        if s and (earliest_start is None or s < earliest_start):
+            earliest_start = s
+    anchor_start = event_start_utc or earliest_start
+
+    # Only compute total if both ends exist
+    total_time_td = last_end - anchor_start if (anchor_start and last_end) else None
+
+    # Wasted time: sum of gaps between sorted attempts by their *per-log* start/end
+    flat_logs = []
+    for logs in attempts.values():
+        for r in logs:
+            s = _parse_dt_any(r.get("timeStart") or r.get("time"))
+            e = _parse_dt_any(r.get("timeEnd"))
+            if s or e:
+                flat_logs.append((s, e))
+    flat_logs.sort(key=lambda se: (se[0] or se[1] or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)))
+
+    wasted = datetime.timedelta(0)
+    prev_end: Optional[datetime.datetime] = None
+    positive_gap_found = False
+    for s, e in flat_logs:
+        if prev_end and s:
+            gap = s - prev_end
+            if gap.total_seconds() > 0:
+                wasted += gap
+                positive_gap_found = True
+        if e and ((prev_end is None) or (e > prev_end)):
+            prev_end = e
+
+    # Build encounter lines
+    lines: List[str] = []
     for (bid, bname), logs in attempts.items():
-        # find first success
+        # first success?
         success_index = None
         success_log = None
         for i, r in enumerate(logs):
@@ -812,6 +902,7 @@ async def build_summary_embed(event_name: str, results: List[dict]) -> discord.E
                 success_log = r
                 break
 
+        # CM flag (if any)
         cm_flag = None
         for r in logs:
             enc = r.get("encounter", {}) if isinstance(r.get("encounter"), dict) else {}
@@ -833,14 +924,38 @@ async def build_summary_embed(event_name: str, results: List[dict]) -> discord.E
             tries = len(logs)
             lines.append(f"• **{bname}{cm_text}** — attempts: **{tries}** — _no kill_ — [latest log]({url})")
 
-    desc = "\n".join(lines) if lines else "No encounters recorded in this event window."
+    # Header with timing — show em-dash (—) when unknown or trivial instead of "0s"
+    def td_or_dash(td: Optional[datetime.timedelta], show_zero: bool = False) -> str:
+        if not td:
+            return "—"
+        if not show_zero and int(td.total_seconds()) == 0:
+            return "—"
+        return _fmt_td_hms(td)
 
-    em = discord.Embed(
-        title=f"📊 Event Summary — {event_name}",
-        description=desc,
-        color=discord.Color.green() if any("kill log" in ln for ln in lines) else discord.Color.orange()
-    )
+    total_text = td_or_dash(total_time_td)
+    wasted_text = td_or_dash(wasted if positive_gap_found else None)  # only show if we had real gaps
+    header_text = f"**Total time:** {total_text} • **Wasted time:** {wasted_text}"
+
+    # Create the embed
+    color = discord.Color.green() if any("kill log" in ln for ln in lines) else discord.Color.orange()
+    em = discord.Embed(title=f"📊 Event Summary — {event_name}", description=header_text, color=color)
     em.set_footer(text="Kill: link to the successful log. No kill: link to the latest attempt.")
+
+    # Multi-column encounter list: up to 3 columns (inline fields)
+    if not lines:
+        em.add_field(name="\u200b", value="_No encounters recorded in this event window._", inline=False)
+        return em
+
+    n = len(lines)
+    cols = 3 if n >= 9 else (2 if n >= 4 else 1)
+    per_col = (n + cols - 1) // cols  # ceiling
+
+    for i in range(cols):
+        chunk = lines[i*per_col:(i+1)*per_col]
+        if not chunk:
+            continue
+        em.add_field(name="\u200b", value="\n".join(chunk), inline=True)
+
     return em
 
 # ---------- CANCEL EVENT (slash, guild) ----------
