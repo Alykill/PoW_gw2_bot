@@ -8,6 +8,50 @@ GLOBAL_PLAYER_METRICS = [
     ("boss_dps",    "Full-fight target DPS (Power+Condi)"),
 ]
 
+# analytics/registry.py
+
+# Minimal mapping; extend as you like
+ENCOUNTER_WINGS_BY_NAME = {
+    # Wing 1 — Spirit Vale
+    "vale guardian": "W1",
+    "gorseval the multifarious": "W1",
+    "sabetha the saboteur": "W1",
+
+    # Wing 2 — Salvation Pass
+    "slothasor": "W2",
+    "bandit trio": "W2",
+    "matthias gabrel": "W2",
+
+    # Wing 3 — Stronghold of the Faithful
+    "escort": "W3",
+    "keep construct": "W3",
+    "twisted castle": "W3",  # event
+    "xera": "W3",
+
+    # Wing 4 — Bastion of the Penitent
+    "cairn the indomitable": "W4",
+    "mursaat overseer": "W4",
+    "samarog": "W4",
+    "deimos": "W4",
+
+    # Wing 5 — Hall of Chains
+    "soulless horror": "W5",           # (Desmina)
+    "river of souls": "W5",            # event
+    "statues of grenth": "W5",         # event chain
+    "dhuum": "W5",
+
+    # Wing 6 — Mythwright Gambit
+    "conjured amalgamate": "W6",
+    "twin largos": "W6",
+    "nikare and kenut": "W6",
+    "qadim": "W6",
+
+    # Wing 7 — The Key of Ahdashim
+    "cardinal adina": "W7",
+    "cardinal sabir": "W7",
+    "qadim the peerless": "W7",
+}
+
 ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
     "vale guardian": [
         {"key": "Boss TP", "label": "Blue ports",

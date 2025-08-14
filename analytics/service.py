@@ -256,7 +256,7 @@ def _collect_mechanic_counts(
         v = j.get(k)
         if isinstance(v, dict) and v:
             for vv in v.values():
-                if isinstance(vv, list) and vv:
+                if isinstance(vv, list) and v:
                     log_candidates.append(vv)
 
     for idx, logs in enumerate(log_candidates):
@@ -430,15 +430,27 @@ async def enrich_upload(upload_id: int, payload: Union[dict, str]):
         await db.commit()
 
 # ---------- Aggregation ----------
+def _truthy_success(val: Any) -> bool:
+    """Normalize success value from uploads table (int/bool/str) to True/False."""
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return int(val) != 0
+    s = str(val).strip().lower()
+    return s in ("1", "true", "t", "yes", "y")
+
 async def build_event_metrics(event_name: str) -> Dict[str, Any]:
     await _ensure_tables()
     async with aiosqlite.connect("events.db") as db:
+        # Pull uploads with success + boss_id so we can pick the FIRST successful attempt per boss
         cur = await db.execute(
             """
-            SELECT id, boss_name
+            SELECT id, boss_name, success, boss_id, time_utc
             FROM uploads
             WHERE event_name = ?
-            ORDER BY time_utc ASC
+            ORDER BY datetime(time_utc) ASC
             """,
             (event_name,),
         )
@@ -452,7 +464,16 @@ async def build_event_metrics(event_name: str) -> Dict[str, Any]:
         top_dps_per_encounter: List[Tuple[str, str, float]] = []
         enc_specific: DefaultDict[str, List[Tuple[str, str, float]]] = defaultdict(list)
 
-        for upload_id, boss_name in uploads:
+        # Pick the first SUCCESSFUL upload per boss (boss_id, boss_name)
+        first_success_by_boss: Dict[Tuple[int, str], int] = {}
+        for upload_id, boss_name, success, boss_id, _t in uploads:
+            if _truthy_success(success):
+                key = (int(boss_id or -1), str(boss_name or ""))
+                if key not in first_success_by_boss:
+                    first_success_by_boss[key] = int(upload_id)
+
+        # Global aggregates & encounter-specific (keep current behavior = include all attempts)
+        for upload_id, boss_name, success, boss_id, _t in uploads:
             # Global aggregates
             for key, agg in [("downs", overall_downs), ("deaths", overall_deaths), ("resurrects", overall_res)]:
                 cur = await db.execute(
@@ -466,21 +487,7 @@ async def build_event_metrics(event_name: str) -> Dict[str, Any]:
                 for actor, v in await cur.fetchall():
                     agg[actor] += float(v or 0)
 
-            # Top DPS per encounter
-            cur = await db.execute(
-                """
-                SELECT actor, value FROM metrics
-                WHERE upload_id = ? AND metric_key = 'boss_dps'
-                ORDER BY value DESC
-                LIMIT 1
-                """,
-                (upload_id,),
-            )
-            top = await cur.fetchone()
-            if top:
-                top_dps_per_encounter.append((boss_name, top[0], float(top[1])))
-
-            # Encounter-specific metrics
+            # Encounter-specific mechanics (unchanged: all attempts)
             b_lower = (boss_name or "").lower()
             wanted_keys: List[str] = []
             for k, specs in ENCOUNTER_MECHANICS.items():
@@ -502,6 +509,21 @@ async def build_event_metrics(event_name: str) -> Dict[str, Any]:
                 label_map = {s["key"]: s["label"] for specs in ENCOUNTER_MECHANICS.values() for s in specs}
                 for k, actor, v in rows:
                     enc_specific[boss_name].append((label_map.get(k, k), actor, float(v or 0)))
+
+        # Compute Top DPS only for the FIRST SUCCESS per boss
+        for (boss_id, boss_name), succ_upload_id in first_success_by_boss.items():
+            cur = await db.execute(
+                """
+                SELECT actor, value FROM metrics
+                WHERE upload_id = ? AND metric_key = 'boss_dps'
+                ORDER BY value DESC
+                LIMIT 1
+                """,
+                (succ_upload_id,),
+            )
+            top = await cur.fetchone()
+            if top:
+                top_dps_per_encounter.append((boss_name, top[0], float(top[1])))
 
     def sort_desc(m: Dict[str, float]) -> List[Tuple[str, int]]:
         return sorted(((a, int(v)) for a, v in m.items()), key=lambda x: (-x[1], x[0].lower()))
@@ -597,28 +619,20 @@ async def build_event_analytics_embeds(event_name: str) -> List[discord.Embed]:
 
     # Three compact columns: downs / deaths / res
     em.add_field(
-        name="Times downed (Top 10)",
+        name="Times downed ♿",
         value=_fmt_table(data.get("overall_downs", [])),
         inline=True,  # 👈 column
     )
     em.add_field(
-        name="Times died (Top 10)",
+        name="Times died 💀",
         value=_fmt_table(data.get("overall_deaths", [])),
         inline=True,  # 👈 column
     )
     em.add_field(
-        name="Resurrects (Top 10)",
+        name="Ressed others 🕊️",
         value=_fmt_table(data.get("overall_resurrects", [])),
         inline=True,  # 👈 column
     )
-
-    # Top DPS per encounter — split across columns (2–3) if long
-    top_dps_rows = data.get("top_boss_dps", [])
-    if top_dps_rows:
-        dps_lines = [f"• **{boss}** — **{actor}** ({int(dps)} DPS)" for boss, actor, dps in top_dps_rows[:25]]
-        em.add_field(name="\u200b", value="\u200b", inline=False)  # spacer
-        em.add_field(name="Top DPS per encounter", value="\u200b", inline=False)
-        _add_multicol_fields(em, dps_lines, max_cols=3)
 
     em.set_footer(text="Metrics from dps.report / Elite Insights JSON")
     embeds.append(em)
