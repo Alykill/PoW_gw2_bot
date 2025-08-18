@@ -563,7 +563,7 @@ async def build_summary_embed(
 
     award_lines = [
         f"**🪦 Pleb** — {_display(deaths_names, deaths_max)}",
-        f"**🫦 Chinese hooker** — {_display(downs_names, downs_max)}",
+        f"**🫦 Testst** — {_display(downs_names, downs_max)}",
         f"💉 **Medic** — {_display(medic_names, medic_max)}",
     ]
 
