@@ -49,6 +49,11 @@ ENCOUNTER_WINGS_BY_NAME = {
     "cardinal adina": "W7",
     "cardinal sabir": "W7",
     "qadim the peerless": "W7",
+
+    # Wing 8 — Mount Balrior
+    "greer": "W8",
+    "decima": "W8",
+    "ura": "W8",
 }
 
 ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
