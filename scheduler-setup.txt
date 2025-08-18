@@ -1,0 +1,61 @@
+Fix the Task Scheduler task
+
+Delete the old task (or disable it), then create a fresh one.
+
+General tab
+
+Name: Discord Raid Bot
+
+User account: your user (USER)
+
+Run only when user is logged on (pick this first; you can harden later)
+
+Run with highest privileges: ✅
+
+Configure for: Windows 10/11
+
+Triggers tab
+
+New…
+
+Begin the task: At log on
+
+Specific user: USER
+
+Delay task for: 30 seconds (gives networking/drive time)
+
+Enabled ✅
+
+(You can switch to “At startup” later. If you do, keep the delay and change the user to your account with “Run whether user is logged on or not” and enter your password so your profile loads. Without storing the password, Windows uses a background logon that doesn’t fully load your profile—often why user-profile paths fail.)
+
+Actions tab
+
+New…
+
+Action: Start a program
+
+Program/script: C:\Users\USER\PycharmProjects\discord-gw2-bot-2-5\run_bot.bat
+
+Start in (optional): C:\Users\USER\PycharmProjects\discord-gw2-bot-2-5
+
+(No quotes here—Task Scheduler doesn’t like them in Start in.)
+
+Do not point to cmd.exe here; start the BAT directly. Your BAT already sets the working dir and logs, so this is simplest.
+
+Conditions tab
+
+Uncheck Start the task only if the computer is on AC power
+
+Uncheck Start only if idle (both idle checkboxes)
+
+(Optional) Check Start only if the following network connection is available: Any connection
+
+Settings tab
+
+Allow task to be run on demand: ✅
+
+If the task fails, restart every: 1 minute, Attempt: 5
+
+If the task is already running: Do not start a new instance
+
+Enable History (View → Enable All Tasks History), Apply, OK.

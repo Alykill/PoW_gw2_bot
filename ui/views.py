@@ -124,7 +124,7 @@ class EditEventModal(discord.ui.Modal, title="Edit Event"):
 
 class EventMessageView(discord.ui.View):
     """Event message view = Sign Up / Sign Out + admin controls."""
-    def __init__(self, event_name: str, event_start: datetime.datetime, channel_id: int, message_id: int,
+    def __init__(self, event_name, event_start, channel_id, message_id,
                  on_signup, on_signout, on_edit, on_cancel, on_end_now):
         super().__init__(timeout=None)
         self.event_name = event_name

@@ -8,13 +8,12 @@ GLOBAL_PLAYER_METRICS = [
     ("boss_dps",    "Full-fight target DPS (Power+Condi)"),
 ]
 
-# analytics/registry.py
-
 # Minimal mapping; extend as you like
 ENCOUNTER_WINGS_BY_NAME = {
     # Wing 1 — Spirit Vale
     "vale guardian": "W1",
-    "gorseval the multifarious": "W1",
+    "spirit race": "W1",
+    "gorseval": "W1",
     "sabetha the saboteur": "W1",
 
     # Wing 2 — Salvation Pass
@@ -65,7 +64,7 @@ ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
         {"key": "Tantrum", "label": "Circle KD",
          "exact": ["Tantrum", "Tripple Circles"], "modes": ["occurrences", "hits"]},
     ],
-    "matthias gaberl": [
+    "matthias gabrel": [
         {"key": "Spirit", "label": "Touched Spirit",
          "exact": ["Spirit", "Spirit hit"], "modes": ["occurrences", "occurrences"]},
     ],

@@ -1,20 +1,39 @@
 # ui/embeds.py
-import datetime, discord, re, asyncio, aiosqlite  # <-- add aiosqlite here
+from __future__ import annotations
+import datetime, re, asyncio
 from typing import List, Dict, Tuple, Optional, Any
+from collections import defaultdict
+import discord
 from config import settings
+import aiosqlite
 
-# --- datetime helpers ---
+# ---- Wing titles used for grouping in the Summary ----
+WING_TITLES = {
+    "W1": "Wing 1 — Spirit Vale",
+    "W2": "Wing 2 — Salvation Pass",
+    "W3": "Wing 3 — Stronghold of the Faithful",
+    "W4": "Wing 4 — Bastion of the Penitent",
+    "W5": "Wing 5 — Hall of Chains",
+    "W6": "Wing 6 — Mythwright Gambit",
+    "W7": "Wing 7 — The Key of Ahdashim",
+    "Other": "Other",
+}
+
+# ---------- datetime / formatting helpers ----------
 def _parse_dt_any(s: Optional[str]) -> Optional[datetime.datetime]:
-    if not s: return None
+    if not s:
+        return None
     try:
-        dt = datetime.datetime.fromisoformat(str(s).replace("Z","+00:00"))
-        if dt.tzinfo is None: dt = dt.replace(tzinfo=datetime.timezone.utc)
+        dt = datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
         return dt.astimezone(datetime.timezone.utc)
     except Exception:
         try:
-            base = str(s).split('.')[0]
+            base = str(s).split(".")[0]
             dt = datetime.datetime.fromisoformat(base)
-            if dt.tzinfo is None: dt = dt.replace(tzinfo=datetime.timezone.utc)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
             return dt.astimezone(datetime.timezone.utc)
         except Exception:
             return None
@@ -32,7 +51,122 @@ def _fmt_uniform(td: Optional[datetime.timedelta]) -> str:
         return f"{m}m {s:02d}s"
     return f"{s}s"
 
-# --- duration parsing ---
+def _fmt_dps_apostrophe(n: float | int | None) -> str:
+    if n is None:
+        return "0"
+    try:
+        return f"{int(round(float(n))):,}".replace(",", "'")
+    except Exception:
+        return str(n)
+
+def _format_encounter_entry(
+    boss: str,
+    attempts: int,
+    success_url: str | None,
+    success_label: str | None,   # e.g. the duration text you already compute for the link
+    top_actor: str | None,
+    top_dps: float | None,
+) -> str:
+    # Line 1
+    first = f"• {boss} — {attempts} pull(s)"
+    if success_url and success_label:
+        first += f" ➡️ [{success_label}]({success_url})"
+
+    # Line 2 (optional)
+    second = ""
+    if top_actor and (top_dps is not None):
+        # NOTE: add " DPS" here
+        second = f"\n└ 💪 {_short_actor(top_actor)} — {_fmt_dps_apostrophe(top_dps)}"
+
+    return first + second
+
+# shorten "Name.1234" -> "Name"
+_NAME_TAG_RE = re.compile(r"\.\d{3,5}$")
+
+def _short_actor(name: str | None) -> str:
+    s = str(name or "")
+    return _NAME_TAG_RE.sub("", s)
+
+async def _worst_player_for_event(event_name: str) -> tuple[str, int] | None:
+    """
+    Return (actor, total_fail_score) where score = deaths + downs + all failed mechanic counts.
+    """
+    # Pull encounter mechanic keys from the registry (lazy import to avoid cycles)
+    try:
+        from analytics.registry import ENCOUNTER_MECHANICS  # type: ignore
+        mech_keys = [spec["key"] for specs in ENCOUNTER_MECHANICS.values() for spec in specs if "key" in spec]
+    except Exception:
+        mech_keys = []
+
+    base_sql = """
+        SELECT m.actor, SUM(m.value) AS total
+        FROM metrics m
+        JOIN uploads u ON u.id = m.upload_id
+        WHERE u.event_name = ?
+          AND (
+                m.metric_key IN ('deaths')
+                {extra_clause}
+              )
+        GROUP BY m.actor
+        ORDER BY total DESC, m.actor ASC
+        LIMIT 1
+    """
+
+    params = [event_name]
+    if mech_keys:
+        placeholders = ",".join("?" for _ in mech_keys)
+        extra_clause = f"OR m.metric_key IN ({placeholders})"
+        sql = base_sql.format(extra_clause=f" {extra_clause} ")
+        params.extend(mech_keys)
+    else:
+        sql = base_sql.format(extra_clause="")
+
+    async with aiosqlite.connect(settings.SQLITE_PATH) as db:
+        cur = await db.execute(sql, params)
+        row = await cur.fetchone()
+        if row:
+            actor, total = row[0], int(row[1] or 0)
+            return actor, total
+    return None
+
+# shorten "Name.1234" -> "Name"
+_NAME_TAG_RE = re.compile(r"\.\d{3,5}$")
+
+def _short_actor(name: str | None) -> str:
+    s = str(name or "")
+    return _NAME_TAG_RE.sub("", s)
+
+def _is_cm_from_result(r: dict) -> bool:
+    """Return True if the upload result indicates Challenge Mode."""
+    enc = r.get("encounter", {}) if isinstance(r.get("encounter"), dict) else {}
+
+    def truthy(v):
+        if isinstance(v, bool): return v
+        if isinstance(v, (int, float)): return int(v) != 0
+        if isinstance(v, str): return v.strip().lower() in {"true","t","yes","y","1","challenge","cm","challenge mode"}
+        return False
+
+    # Common boolean-ish flags
+    for v in (
+        enc.get("isCM"), enc.get("isCm"), enc.get("cm"), enc.get("challengeMode"),
+        r.get("isCM"),   r.get("isCm"),   r.get("cm"),   r.get("challengeMode"),
+    ):
+        if v is not None and truthy(v):
+            return True
+
+    # String mode field
+    mode = enc.get("mode") or r.get("mode")
+    if isinstance(mode, str) and "challenge" in mode.lower():
+        return True
+
+    # Tags array fallback
+    tags = enc.get("tags") or r.get("tags")
+    if isinstance(tags, list) and any(isinstance(t, str) and "challenge" in t.lower() for t in tags):
+        return True
+
+    return False
+
+# ---------- duration parsing ----------
 def _parse_colon_duration(text: str) -> Optional[datetime.timedelta]:
     """
     Supports H:MM:SS(.mmm), MM:SS(.mmm), SS(.mmm)
@@ -40,8 +174,7 @@ def _parse_colon_duration(text: str) -> Optional[datetime.timedelta]:
     t = str(text).strip()
     if not t:
         return None
-    # SS(.mmm)
-    if ":" not in t:
+    if ":" not in t:  # SS(.mmm)
         m = re.match(r"^(\d+)(?:\.(\d{1,3}))?$", t)
         if not m:
             return None
@@ -51,7 +184,6 @@ def _parse_colon_duration(text: str) -> Optional[datetime.timedelta]:
     parts = t.split(":")
     try:
         if len(parts) == 2:
-            # MM:SS(.mmm)
             mm = int(parts[0])
             sec_part = parts[1]
             if "." in sec_part:
@@ -60,7 +192,6 @@ def _parse_colon_duration(text: str) -> Optional[datetime.timedelta]:
             else:
                 return datetime.timedelta(minutes=mm, seconds=int(sec_part))
         elif len(parts) == 3:
-            # H:MM:SS(.mmm)
             hh = int(parts[0]); mm = int(parts[1]); sec_part = parts[2]
             if "." in sec_part:
                 s, ms = sec_part.split(".", 1)
@@ -74,7 +205,7 @@ def _parse_colon_duration(text: str) -> Optional[datetime.timedelta]:
 def _extract_duration_td_from_result(r: dict) -> Optional[datetime.timedelta]:
     """
     Try to read duration directly from the upload result dict.
-    We look at r['encounter'] first, then top-level; and also support a cached __dur_ms field.
+    We look at r['encounter'] first, then top-level; also support a cached __dur_ms field.
     """
     enc = r.get("encounter", {}) if isinstance(r.get("encounter"), dict) else {}
     # Cached by our enrichment
@@ -89,9 +220,11 @@ def _extract_duration_td_from_result(r: dict) -> Optional[datetime.timedelta]:
         for obj in (enc, r):
             ms = obj.get(key)
             if ms is not None:
-                try: return datetime.timedelta(milliseconds=int(ms))
-                except Exception: pass
-    # Text with units
+                try:
+                    return datetime.timedelta(milliseconds=int(ms))
+                except Exception:
+                    pass
+    # Text with units or colon time
     for key in ("duration", "durationText", "fightDuration"):
         for obj in (enc, r):
             txt = obj.get(key)
@@ -150,11 +283,9 @@ async def _enrich_result_with_ei_duration(r: dict) -> None:
                         break
         if dur_ms is not None:
             r["__dur_ms"] = dur_ms
-            # Mirror onto encounter for downstream readability
             if not isinstance(r.get("encounter"), dict):
                 r["encounter"] = {}
             r["encounter"].setdefault("durationMS", dur_ms)
-            # Also surface an ISO-ish fightDuration string for display if needed
             secs = dur_ms / 1000.0
             h = int(secs // 3600); m = int((secs % 3600) // 60); s = int(secs % 60)
             r["encounter"].setdefault("fightDuration", f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}")
@@ -163,22 +294,62 @@ async def _enrich_result_with_ei_duration(r: dict) -> None:
         return
 
 async def _ensure_durations(results: List[dict]) -> None:
-    # Enrich in parallel with modest concurrency
     sem = asyncio.Semaphore(4)
     async def one(r):
         async with sem:
             await _enrich_result_with_ei_duration(r)
     await asyncio.gather(*(one(r) for r in results))
 
-# --- main builder ---
-def _fmt_dps_apostrophe(n: float | int | None) -> str:
-    if n is None:
-        return "0"
-    try:
-        return f"{int(round(float(n))):,}".replace(",", "'")
-    except Exception:
-        return str(n)
+async def _top_actor_for_metric(event_name: str, metric_key: str) -> str | None:
+    """
+    Return the actor with the highest SUM(value) for the given metric_key
+    across all uploads in this event. Keys: 'deaths', 'downs', 'resurrects'.
+    """
+    async with aiosqlite.connect(settings.SQLITE_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT actor, SUM(value) AS v
+            FROM metrics
+            WHERE metric_key = ?
+              AND upload_id IN (SELECT id FROM uploads WHERE event_name = ?)
+            GROUP BY actor
+            ORDER BY v DESC, actor ASC
+            LIMIT 1
+            """,
+            (metric_key, event_name),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else None
 
+async def _top_actors_for_metric(event_name: str, metric_key: str) -> tuple[list[str], int]:
+    """
+    Return (actors_tied_for_max, max_total). If the table is missing or empty, returns ([], 0).
+    """
+    try:
+        async with aiosqlite.connect(settings.SQLITE_PATH) as db:
+            cur = await db.execute(
+                """
+                SELECT m.actor, SUM(m.value) AS total
+                FROM metrics m
+                JOIN uploads u ON u.id = m.upload_id
+                WHERE u.event_name = ? AND m.metric_key = ?
+                GROUP BY m.actor
+                """,
+                (event_name, metric_key),
+            )
+            rows = await cur.fetchall()
+    except Exception:
+        # covers "no such table: metrics" and any transient DB issue
+        return [], 0
+
+    if not rows:
+        return [], 0
+
+    max_total = max(int(r[1] or 0) for r in rows)
+    top = [str(r[0]) for r in rows if int(r[1] or 0) == max_total]
+    return top, max_total
+
+# ---------- DB helper for Top DPS ----------
 async def _fetch_top_dps_by_permalink(permalinks: List[str]) -> Dict[str, Tuple[str, float]]:
     """
     Return {permalink -> (actor, dps)} for the top DPS on that upload.
@@ -187,9 +358,7 @@ async def _fetch_top_dps_by_permalink(permalinks: List[str]) -> Dict[str, Tuple[
     if not permalinks:
         return result
 
-    # Dedup to reduce queries
     unique = list(dict.fromkeys([p for p in permalinks if p]))
-
     async with aiosqlite.connect(settings.SQLITE_PATH) as db:
         for pl in unique:
             try:
@@ -208,17 +377,19 @@ async def _fetch_top_dps_by_permalink(permalinks: List[str]) -> Dict[str, Tuple[
                 if row:
                     result[pl] = (row[0], float(row[1]))
             except Exception:
-                # ignore this one and continue
                 pass
     return result
 
+
+
+# ---------- Main: Summary embed ----------
 async def build_summary_embed(
     event_name: str,
     results: List[dict],
     event_start_utc: Optional[datetime.datetime] = None,
     event_end_utc: Optional[datetime.datetime] = None,
 ) -> discord.Embed:
-    # Ensure we can read durations for Fight/links
+    # Make sure each result has a duration we can read
     await _ensure_durations(results)
 
     # Group logs per boss
@@ -232,7 +403,7 @@ async def build_summary_embed(
     for k in attempts:
         attempts[k].sort(key=lambda x: (x.get("timeEnd") or "", x.get("timeStart") or x.get("time") or ""))
 
-    # Sum fight time
+    # Sum fight time from per-encounter durations
     fight_total = datetime.timedelta(0)
     for logs in attempts.values():
         for r in logs:
@@ -240,9 +411,8 @@ async def build_summary_embed(
             if td:
                 fight_total += td
 
-    # Pre-fetch top DPS per successful permalink
+    # Pre-fetch top DPS for first success per boss
     success_permalinks: List[str] = []
-    success_index_by_pl: Dict[str, int] = {}
     for (_bid, _bname), logs in attempts.items():
         for i, r in enumerate(logs):
             enc = r.get("encounter", {}) if isinstance(r.get("encounter"), dict) else {}
@@ -250,8 +420,7 @@ async def build_summary_embed(
                 pl = r.get("permalink", "")
                 if pl:
                     success_permalinks.append(pl)
-                    success_index_by_pl[pl] = i
-                break  # only the first success matters for the line
+                break
     top_dps_map = await _fetch_top_dps_by_permalink(success_permalinks)
 
     # Total & Wait based on event window
@@ -262,44 +431,97 @@ async def build_summary_embed(
     if wait_time is not None and wait_time.total_seconds() < 0:
         wait_time = datetime.timedelta(0)
 
-    # Build boss lines (include Top DPS after success hyperlink)
-    boss_lines: List[str] = []
+    # Build one line per boss, then group by wing
+    raw_lines: List[Tuple[str, str]] = []
+
+    # Import wing map lazily to avoid cycles
+    try:
+        from analytics.registry import ENCOUNTER_WINGS_BY_NAME  # type: ignore
+    except Exception:
+        ENCOUNTER_WINGS_BY_NAME = {}
+
+    def wing_code_for(boss_name: str) -> str:
+        bn = (boss_name or "").lower()
+        code = ENCOUNTER_WINGS_BY_NAME.get(bn)
+        if code:
+            return code
+        # substring fallback (tolerates punctuation/variants)
+        for k, v in ENCOUNTER_WINGS_BY_NAME.items():
+            if k in bn:
+                return v
+        return "Other"
+
     for (bid, bname), logs in attempts.items():
-        success_idx = None; success_log = None; cm_flag = None
+        success_idx = None
+        success_log = None
+        cm_flag = None
+
         for i, r in enumerate(logs):
             enc = r.get("encounter", {}) if isinstance(r.get("encounter"), dict) else {}
             if enc.get("success", r.get("success", False)):
-                success_idx = i; success_log = r; break
+                success_idx = i
+                success_log = r
+                break
+
         for r in logs:
             enc = r.get("encounter", {}) if isinstance(r.get("encounter"), dict) else {}
-            if "isCM" in enc: cm_flag = enc.get("isCM"); break
-            if "isCM" in r: cm_flag = r.get("isCM"); break
-        cm_text = " [CM]" if cm_flag else ""
+            if "isCM" in enc:
+                cm_flag = enc.get("isCM")
+                break
+            if "isCM" in r:
+                cm_flag = r.get("isCM")
+                break
+
+        cm_text = " 🔴" if cm_flag else ""
 
         if success_log:
             dur_td = _extract_duration_td_from_result(success_log)
             dur_txt = _fmt_uniform(dur_td) if dur_td else "success"
-            url = success_log.get("permalink", "") or ""
-            suffix = ""
-            if url and url in top_dps_map:
-                actor, dps = top_dps_map[url]
-                suffix = f" - 👑 **{actor}** - {_fmt_dps_apostrophe(dps)} ⚔️"
-            line = f"• **{bname}{cm_text}** — {success_idx + 1} attempt(s) ✅ [{dur_txt}]({url}){suffix}"
-        else:
-            line = f"• **{bname}{cm_text}** — {len(logs)} attempt(s) ❌"
-        boss_lines.append(line)
+            url = success_log.get("permalink") or ""
 
-    # Two columns
-    left_lines, right_lines = [], []
-    for i, ln in enumerate(boss_lines):
-        (left_lines if i % 2 == 0 else right_lines).append(ln)
-    left_text = "\n".join(left_lines) if left_lines else "\u200b"
-    right_text = "\n".join(right_lines) if right_lines else "\u200b"
+            top_actor = None
+            top_dps = None
+            if url and url in top_dps_map:
+                top_actor, top_dps = top_dps_map[url]
+
+            line = _format_encounter_entry(
+                boss=f"**{bname}{cm_text}**",
+                attempts=(success_idx + 1) if success_idx is not None else len(logs),
+                success_url=url if url else None,
+                success_label=dur_txt,
+                top_actor=top_actor,
+                top_dps=top_dps,
+            )
+        else:
+            line = f"• **{bname}{cm_text}** — {len(logs)} pull(s) ❌"
+
+        raw_lines.append((wing_code_for(bname), line))
+
+    # Group & order: W1..W7..Other, with full titles
+    grouped: Dict[str, List[str]] = defaultdict(list)
+    for code, ln in raw_lines:
+        grouped[code].append(ln)
+
+    wing_order = [f"W{i}" for i in range(1, 8)] + ["Other"]
+    parts: List[str] = []
+    for code in wing_order:
+        lines = grouped.get(code)
+        if not lines:
+            continue
+        title = WING_TITLES.get(code, code)
+        parts.append(f"**{title}**")
+        parts.extend(lines)
+
+    encounters_text = "\n".join(parts) if parts else "_No encounters found_"
 
     # Assemble embed
     attempts_count = sum(len(v) for v in attempts.values())
     desc_top = f"You did **{attempts_count}** boss {'try' if attempts_count == 1 else 'tries'} during this event."
-    em = discord.Embed(title=f"📊 Event Summary — {event_name}", description=desc_top, color=discord.Color.green())
+    em = discord.Embed(
+        title=f"📊 Event Summary — {event_name}",
+        description=desc_top,
+        color=discord.Color.green()
+    )
 
     # Column 1: Session
     if start_anchor and end_anchor:
@@ -314,13 +536,46 @@ async def build_summary_embed(
     # Column 2: Distribution
     em.add_field(
         name="Distribution",
-        value=f"Total: {_fmt_uniform(total_time)}\nFight: {_fmt_uniform(fight_total)}\nWait: {_fmt_uniform(wait_time)}",
+        value=f"⌛ Total: {_fmt_uniform(total_time)}\n⚔️ Fight: {_fmt_uniform(fight_total)}\n😴 Wait: {_fmt_uniform(wait_time)}",
         inline=True
     )
 
-    # Spacer + "Raid wing" section (two columns of boss lines)
-    em.add_field(name="\u200b", value="\u200b", inline=False)
-    em.add_field(name="Raid wing", value=left_text, inline=True)
-    em.add_field(name="\u200b", value=right_text, inline=True)
+    # --- Worst player mention (before Session stars) ---
+    worst = await _worst_player_for_event(event_name)
+    if worst:
+        worst_actor, worst_score = worst
+        em.add_field(
+            name="🏆 Pug of the week 🏆",
+            value=f"{_short_actor(worst_actor)} — {worst_score} (deaths + failed mechanics)",
+            inline=False
+        )
+        em.add_field(name="\u200b", value="\u200b", inline=False)
 
+    # --- Awards (ties + "none" when max == 0) ---
+    def _display(names: list[str], total: int) -> str:
+        if total <= 0 or not names:
+            return "none"
+        return " + ".join(_short_actor(n) for n in names)
+
+    medic_names, medic_max   = await _top_actors_for_metric(event_name, "resurrects")
+    downs_names, downs_max   = await _top_actors_for_metric(event_name, "downs")
+    deaths_names, deaths_max = await _top_actors_for_metric(event_name, "deaths")
+
+    award_lines = [
+        f"**🪦 Pleb** — {_display(deaths_names, deaths_max)}",
+        f"**🫦 Chinese hooker** — {_display(downs_names, downs_max)}",
+        f"💉 **Medic** — {_display(medic_names, medic_max)}",
+    ]
+
+    em.add_field(
+        name="✨ Session stars ✨",
+        value="\n".join(award_lines),
+        inline=False
+    )
+
+    # Spacer + single-column grouped encounters
+    em.add_field(name="\u200b", value="\u200b", inline=False)
+    em.add_field(name="Encounters", value=encounters_text, inline=False)
+
+    em.colour = discord.Colour(0x2ecc71)  # force a bright green
     return em

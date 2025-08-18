@@ -45,6 +45,15 @@ def _boss_name(j: Dict[str, Any]) -> str:
     boss = enc.get("boss") or j.get("boss") or j.get("fightName") or "Unknown Encounter"
     return str(boss).strip()
 
+def _norm_boss(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+def _boss_key_matches(boss_name: str, key: str) -> bool:
+    nb = _norm_boss(boss_name)
+    nk = _norm_boss(key)
+    # match either way: "gorseval" vs "gorseval the multifarious"
+    return nk in nb or nb in nk
+
 def _players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
     ps = j.get("players")
     return ps if isinstance(ps, list) else []
@@ -129,7 +138,9 @@ def _collect_mechanic_counts(
     """
     Return {account -> count} for a given mechanic spec.
 
-    Matching: exact (preferred) or substring fallback.
+    Matching:
+      - exact_names (preferred): exact OR substring (robust)
+      - substrings: normalized substring fallback
     Priority:
       1) mechanics[*].players / playerHits (EI aggregated)
       2) mechanics[*].mechanicsData (per hit, dedup across entries using canonical key; optional time tolerance)
@@ -146,18 +157,37 @@ def _collect_mechanic_counts(
             str(m.get("tooltip") or ""),
         )
 
+    def _norm(s: Optional[str]) -> str:
+        s = (s or "").lower().strip()
+        # remove non-alphanumerics to tolerate punctuation/spacing variants
+        return re.sub(r"[^a-z0-9]+", "", s)
+
+    # Precompute normalized inputs
+    exact_norm = [_norm(x) for x in (exact_names or []) if x]
+    subs_norm  = [_norm(x) for x in (substrings or []) if x]
+
     def _match(m: Dict[str, Any]) -> bool:
         name, short, full, desc, tip = _texts(m)
-        if exact_names:
-            lowers = {t.strip().lower() for t in (name, short, full) if t}
-            exacts = {e.strip().lower() for e in exact_names if e}
-            return bool(lowers & exacts)
-        lows = [t.lower() for t in (name, short, full, desc, tip) if t]
-        needles = [s.lower() for s in (substrings or []) if s]
-        return any(any(n in t for t in lows) for n in needles)
+        fields = [name, short, full, desc, tip]
+        fields_norm = [_norm(t) for t in fields if t]
+
+        # 1) Exact (normalized) or "exact as substring" fallback
+        if exact_norm:
+            for f in fields_norm:
+                for ex in exact_norm:
+                    if f == ex or (ex and ex in f) or (f and f in ex):
+                        return True
+
+        # 2) Substring candidates (normalized)
+        if subs_norm:
+            for f in fields_norm:
+                for sub in subs_norm:
+                    if sub and sub in f:
+                        return True
+
+        return False
 
     canon_key = (canonical or (",".join((exact_names or substrings or ["mechanic"])))).strip().lower()
-
     per_actor: DefaultDict[str, int] = defaultdict(int)
 
     # Map character -> account
@@ -175,7 +205,7 @@ def _collect_mechanic_counts(
     for m in mechanics:
         if not isinstance(m, dict) or not _match(m):
             continue
-        players_list = m.get("players") or m.get("playerHits")
+        players_list = m.get("players") or m.get("playerHits")  # support both keys
         if isinstance(players_list, list) and players_list:
             used_agg = True
             for rec in players_list:
@@ -187,25 +217,25 @@ def _collect_mechanic_counts(
                 if not account:
                     continue
                 c = rec.get("c", rec.get("count", 1))
-                try: c = int(c)
-                except Exception: c = 1
+                try:
+                    c = int(c)
+                except Exception:
+                    c = 1
                 if c > 0:
                     per_actor[str(account)] += c
     if used_agg:
         return dict(per_actor)
 
-    # Helper: cross-entry dedup
-    # For each (account, canon_key) keep a list of (ms, entry_index) we've already counted.
+    # Helper: cross-entry dedup across mechanics entries
     seen_by_actor: Dict[Tuple[str, str], List[Tuple[int, int]]] = defaultdict(list)
 
     def _already_seen(account: str, ms: Optional[int], entry_idx: int) -> bool:
         if ms is None:
             return False
         lst = seen_by_actor[(account, canon_key)]
-        # cross-entry dedup: allow same-entry duplicates, suppress different-entry duplicates
         for prev_ms, prev_idx in lst:
             if prev_idx == entry_idx:
-                continue  # same entry → keep (don’t dedup)
+                continue  # same entry => don't dedup
             if dedup_ms is None:
                 if prev_ms == ms:
                     return True
@@ -219,7 +249,7 @@ def _collect_mechanic_counts(
             return
         seen_by_actor[(account, canon_key)].append((ms, entry_idx))
 
-    # ---- 2) mechanics[*].mechanicsData ----
+    # ---- 2) mechanics[*].mechanicsData (per-hit) ----
     for idx, m in enumerate(mechanics):
         if not isinstance(m, dict) or not _match(m):
             continue
@@ -246,7 +276,7 @@ def _collect_mechanic_counts(
     if per_actor:
         return dict(per_actor)
 
-    # ---- 3) Fallback: top-level logs ----
+    # ---- 3) Fallback: top-level logs variants ----
     log_candidates: List[List[Dict[str, Any]]] = []
     for k in ("mechanicLogs", "mechanicsLogs", "mechanicsLog", "mechanicsEvents", "mechLogs"):
         v = j.get(k)
@@ -256,7 +286,7 @@ def _collect_mechanic_counts(
         v = j.get(k)
         if isinstance(v, dict) and v:
             for vv in v.values():
-                if isinstance(vv, list) and v:
+                if isinstance(vv, list) and vv:
                     log_candidates.append(vv)
 
     for idx, logs in enumerate(log_candidates):
@@ -287,6 +317,7 @@ def _collect_mechanic_counts(
             per_actor[str(account)] += 1
 
     return dict(per_actor)
+
 
 # ---------- Payload normalization (permalink/file -> EI dict) ----------
 async def _coerce_payload_to_json(payload: Union[dict, str]) -> Dict[str, Any]:
@@ -405,9 +436,9 @@ async def enrich_upload(upload_id: int, payload: Union[dict, str]):
         rows.append((upload_id, actor, "boss_dps",   float(_player_boss_dps(p))))
 
     # Encounter-specific mechanics via registry
-    b_lower = boss.lower()
+    b_name = boss  # keep original
     for key, specs in ENCOUNTER_MECHANICS.items():
-        if key in b_lower:
+        if _boss_key_matches(b_name, key):
             for spec in specs:
                 counts = _collect_mechanic_counts(
                     upload_json,
@@ -488,10 +519,9 @@ async def build_event_metrics(event_name: str) -> Dict[str, Any]:
                     agg[actor] += float(v or 0)
 
             # Encounter-specific mechanics (unchanged: all attempts)
-            b_lower = (boss_name or "").lower()
             wanted_keys: List[str] = []
             for k, specs in ENCOUNTER_MECHANICS.items():
-                if k in b_lower:
+                if _boss_key_matches(boss_name or "", k):
                     wanted_keys.extend([s["key"] for s in specs])
             if wanted_keys:
                 marks = ",".join("?" for _ in wanted_keys)
@@ -536,16 +566,26 @@ async def build_event_metrics(event_name: str) -> Dict[str, Any]:
         "encounter_specific": dict(enc_specific),
     }
 
+# shorten "Name.1234" -> "Name"
+_NAME_TAG_RE = re.compile(r"\.\d{3,5}$")
+
+def _short_actor(name: str | None) -> str:
+    s = str(name or "")
+    return _NAME_TAG_RE.sub("", s)
+
 # ---------- Embeds ----------
 def _fmt_table(rows: List[Tuple[str, float]], limit: int = 10) -> str:
     if not rows:
         return "_No data_"
-    return "\n".join(f"• **{a}** — {int(v)}" for a, v in rows[:limit])
+    return "\n".join(f"• **{_short_actor(a)}** — {int(v)}" for a, v in rows[:limit])
 
 def _fmt_top_dps(rows: List[Tuple[str, str, float]], limit: int = 10) -> str:
     if not rows:
         return "_No data_"
-    return "\n".join(f"• **{boss}** — **{actor}** ({int(dps)} DPS)" for boss, actor, dps in rows[:limit])
+    return "\n".join(
+        f"• **{boss}** — **{_short_actor(actor)}** ({int(dps)} DPS)"
+        for boss, actor, dps in rows[:limit]
+    )
 
 def _add_multicol_fields(
     em: discord.Embed,
@@ -608,6 +648,30 @@ async def ensure_enriched_for_event(event_name: str) -> int:
 
     return repaired
 
+def _sum_mech(values):
+    return sum(int(v) for _a, v in values)
+
+def _format_mechanics_two_cols(by_label: DefaultDict[str, List[Tuple[str, float]]],
+                               per_label_limit: int = 10) -> Tuple[str, str]:
+    """
+    Collapse per-label mechanics into two text columns.
+    Each label block shows the label header and top actors with counts.
+    """
+    # Sort labels by total desc
+    labels_sorted = sorted(by_label.keys(), key=lambda k: -_sum_mech(by_label[k]))
+
+    left_blocks, right_blocks = [], []
+    for i, label in enumerate(labels_sorted):
+        arr_sorted = sorted(by_label[label], key=lambda x: (-x[1], x[0].lower()))
+        lines = [f"**{label}**"] + [f"• **{actor}** — {int(v)}" for actor, v in arr_sorted[:per_label_limit]]
+        block = "\n".join(lines)
+        (left_blocks if i % 2 == 0 else right_blocks).append(block)
+
+    col1 = "\n\n".join(left_blocks) if left_blocks else "_No data_"
+    col2 = "\n\n".join(right_blocks) if right_blocks else "_No data_"
+    return col1, col2
+
+
 async def build_event_analytics_embeds(event_name: str) -> List[discord.Embed]:
     data = await build_event_metrics(event_name)
     if not data:
@@ -615,50 +679,49 @@ async def build_event_analytics_embeds(event_name: str) -> List[discord.Embed]:
 
     embeds: List[discord.Embed] = []
 
+    # Primary analytics embed
     em = discord.Embed(title=f"📈 Analytics — {event_name}", color=discord.Color.purple())
-
-    # Three compact columns: downs / deaths / res
-    em.add_field(
-        name="Times downed ♿",
-        value=_fmt_table(data.get("overall_downs", [])),
-        inline=True,  # 👈 column
-    )
-    em.add_field(
-        name="Times died 💀",
-        value=_fmt_table(data.get("overall_deaths", [])),
-        inline=True,  # 👈 column
-    )
-    em.add_field(
-        name="Ressed others 🕊️",
-        value=_fmt_table(data.get("overall_resurrects", [])),
-        inline=True,  # 👈 column
-    )
-
+    em.add_field(name="Times downed ♿", value=_fmt_table(data.get("overall_downs", [])), inline=True)
+    em.add_field(name="Times died 💀",  value=_fmt_table(data.get("overall_deaths", [])), inline=True)
+    em.add_field(name="Ressed others 🕊️", value=_fmt_table(data.get("overall_resurrects", [])), inline=True)
     em.set_footer(text="Metrics from dps.report / Elite Insights JSON")
     embeds.append(em)
 
+    # Append encounter mechanics INSIDE the analytics embed (after metrics).
     enc_spec = data.get("encounter_specific", {})
+    current = em
+
     for enc_name, rows in enc_spec.items():
-        by_label: DefaultDict[str, List[Tuple[str, float]]] = defaultdict(list)
-        totals: DefaultDict[str, int] = defaultdict(int)
+        # Aggregate rows across all attempts:
+        # label -> (actor -> summed value)
+        per_label_sums: DefaultDict[str, DefaultDict[str, float]] = defaultdict(lambda: defaultdict(float))
         for label, actor, v in rows:
-            by_label[label].append((actor, v))
-            totals[label] += int(v)
+            per_label_sums[label][actor] += float(v or 0)
 
-        em2 = discord.Embed(title=f"🧩 Encounter Mechanics — {enc_name}", color=discord.Color.blurple())
+        # Convert to label -> [(actor_display, total)] with shortened names,
+        # sorted desc by total then by name. We keep aggregation on full accounts,
+        # and only shorten at display time.
+        by_label_display: DefaultDict[str, List[Tuple[str, float]]] = defaultdict(list)
+        for label, actor_map in per_label_sums.items():
+            aggregated_short = [(_short_actor(actor), total) for actor, total in actor_map.items()]
+            aggregated_short.sort(key=lambda x: (-x[1], x[0].lower()))
+            by_label_display[label] = aggregated_short
 
-        # Sort labels by total desc
-        labels_sorted = sorted(by_label.keys(), key=lambda k: -totals[k])
+        # Format into two columns of text
+        col1, col2 = _format_mechanics_two_cols(by_label_display, per_label_limit=10)
 
-        # Render each mechanic label as an inline field (Discord will flow them into up to 3 columns)
-        for label in labels_sorted:
-            arr_sorted = sorted(by_label[label], key=lambda x: (-x[1], x[0].lower()))
-            em2.add_field(
-                name=label,
-                value=_fmt_table(arr_sorted, limit=10),
-                inline=True,  # 👈 columnized per label
-            )
+        # Ensure we don't exceed Discord's 25 fields per embed
+        # We will add 3 fields per encounter section: spacer + 2 columns
+        if len(current.fields) + 3 > 25:
+            current = discord.Embed(title=f"📈 Analytics — {event_name} (cont.)", color=discord.Color.purple())
+            embeds.append(current)
 
-        embeds.append(em2)
+        # Spacer to break to a new row inside the same embed
+        current.add_field(name="\u200b", value="\u200b", inline=False)
+        # First column carries the section header
+        current.add_field(name=f"Failed Mechanics — {enc_name}", value=col1, inline=True)
+        # Only add second column if it actually has content
+        if col2.strip() and col2.strip() != "_No data_":
+            current.add_field(name="\u200b", value=col2, inline=True)
 
     return embeds

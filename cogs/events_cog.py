@@ -2,7 +2,7 @@ from __future__ import annotations
 import os, re, datetime, logging, discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 from config import settings
 from infra.scheduler import scheduler
 import aiosqlite
@@ -12,6 +12,8 @@ from repos.sqlite_repo import ensure_tables, SqliteEventRepo, SqliteSignupRepo
 from services.session import EventSession
 from services.upload_service import process_pending_uploads
 from analytics.service import ensure_enriched_for_event, build_event_analytics_embeds
+
+# test
 
 log = logging.getLogger("events")
 
@@ -69,12 +71,6 @@ class EventsCog(commands.Cog):
     def cog_unload(self):
         self._pending_worker.cancel()
 
-    # BEFORE
-    @tasks.loop(minutes=1.0)
-    async def _pending_worker(self):
-        await process_pending_uploads()
-
-    # AFTER
     @tasks.loop(seconds=settings.PENDING_SCAN_SECONDS)
     async def _pending_worker(self):
         await process_pending_uploads()
@@ -87,6 +83,21 @@ class EventsCog(commands.Cog):
     @commands.Cog.listener()
     async def on_ready(self):
         log.info("EventsCog ready")
+        try:
+            await self._rehydrate_jobs()
+            log.info("Rehydrated scheduled jobs from DB (start/end/reminders + sessions)")
+        except Exception as e:
+            log.exception(f"Rehydrate failed: {e}")
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        log.info("EventsCog ready")
+        try:
+            await self._rehydrate_jobs()
+            await self._rehydrate_views()  # <-- add this line
+            log.info("Rehydrated scheduled jobs and views")
+        except Exception as e:
+            log.exception(f"Rehydrate failed: {e}")
 
     # -------- Slash commands --------
 
@@ -110,6 +121,118 @@ class EventsCog(commands.Cog):
         await ctx.send("Use the button to create a new event:", view=EventCreatorView(self._open_modal))
 
     # -------- Internal handlers --------
+
+    # --- Add near top of EventsCog (utilities) ---
+    def _parse_iso_utc(self, s: str | None) -> datetime.datetime | None:
+        if not s:
+            return None
+        try:
+            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            return dt.astimezone(datetime.timezone.utc)
+        except Exception:
+            return None
+
+    async def _rehydrate_jobs(self):
+        """
+        On bot startup, reconstruct start/end jobs, resume active sessions for
+        in-progress events, and (re)schedule T-15 reminders for signups.
+        """
+        await ensure_tables(settings.SQLITE_PATH)
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        async with aiosqlite.connect(settings.SQLITE_PATH) as db:
+            # events to consider (future or ongoing)
+            cur = await db.execute("""
+                SELECT name, user_id, channel_id, start_time, end_time, message_id
+                FROM events
+            """)
+            rows = await cur.fetchall()
+
+            for name, creator_id, channel_id, start_iso, end_iso, message_id in rows:
+                start_dt = self._parse_iso_utc(start_iso)
+                end_dt = self._parse_iso_utc(end_iso)
+                if not start_dt or not end_dt:
+                    continue
+                if end_dt <= now:
+                    # Already in the past; nothing to schedule
+                    continue
+
+                # Always schedule (or reschedule) the END job
+                try:
+                    scheduler.remove_job(f"end:{name}:{channel_id}")
+                except Exception:
+                    pass
+                scheduler.add_job(
+                    self._end_event, 'date',
+                    id=f"end:{name}:{channel_id}", replace_existing=True,
+                    run_date=end_dt, args=[name, channel_id]
+                )
+
+                if now < start_dt:
+                    # Future event → schedule START
+                    try:
+                        scheduler.remove_job(f"start:{name}:{channel_id}")
+                    except Exception:
+                        pass
+                    scheduler.add_job(
+                        self._start_event, 'date',
+                        id=f"start:{name}:{channel_id}", replace_existing=True,
+                        run_date=start_dt, args=[name, channel_id]
+                    )
+
+                    # Re-schedule T-15 reminders for existing signups
+                    cur2 = await db.execute(
+                        "SELECT user_id FROM signups WHERE event_name = ?", (name,)
+                    )
+                    for (uid,) in await cur2.fetchall():
+                        remind_at = start_dt - datetime.timedelta(minutes=15)
+                        if remind_at > now:
+                            scheduler.add_job(
+                                send_dm_reminder, 'date',
+                                id=f"reminder:{uid}:{name}", replace_existing=True,
+                                run_date=remind_at,
+                                args=[self.bot, int(uid), name, start_dt]
+                            )
+                        # else: inside 15m window; skip auto-DM on boot to avoid spam
+                else:
+                    # In-progress event → create session and ensure the END is scheduled
+                    if settings.LOG_DIR and os.path.isdir(settings.LOG_DIR):
+                        active_sessions[(name, channel_id)] = EventSession(
+                            name, start_dt, end_dt, channel_id, settings.LOG_DIR
+                        )
+                        # Start the watcher immediately
+                        active_sessions[(name, channel_id)].start_task()
+
+    async def _load_results_for_summary(self, event_name: str) -> List[dict]:
+        """
+        Build a minimal 'results' array from DB so build_summary_embed works
+        even if the process was rebooted (no in-memory EventSession).
+        """
+        rows: List[tuple] = []
+        async with aiosqlite.connect(settings.SQLITE_PATH) as db:
+            cur = await db.execute("""
+                SELECT boss_id, boss_name, success, COALESCE(NULLIF(permalink,''), file_path), time_utc
+                FROM uploads
+                WHERE event_name = ?
+                ORDER BY datetime(time_utc) ASC
+            """, (event_name,))
+            rows = await cur.fetchall()
+
+        results: List[dict] = []
+        for boss_id, boss_name, success, src, time_utc in rows:
+            results.append({
+                "encounter": {
+                    "bossId": int(boss_id or -1),
+                    "boss": boss_name or "Unknown Encounter",
+                    "success": bool(success),
+                },
+                # build_summary_embed will enrich duration from permalink if needed
+                "permalink": src or "",
+                "timeStart": time_utc or "",
+            })
+        return results
 
     async def _open_modal(self, interaction: discord.Interaction):
         await interaction.response.send_modal(CreateEventModal(self._handle_create_submit))
@@ -153,6 +276,26 @@ class EventsCog(commands.Cog):
             ephemeral=True
         )
 
+    async def _rehydrate_views(self):
+        """Re-register persistent views for all not-yet-ended events so buttons work after reboot."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        async with aiosqlite.connect(settings.SQLITE_PATH) as db:
+            cur = await db.execute(
+                "SELECT name, channel_id, message_id, start_time, end_time "
+                "FROM events WHERE end_time > ?", (now.isoformat(),)
+            )
+            rows = await cur.fetchall()
+
+        for name, channel_id, message_id, start_iso, end_iso in rows:
+            start_dt = self._parse_iso_utc(start_iso) or now
+            view = EventMessageView(
+                name, start_dt, channel_id, message_id,
+                self._on_signup, self._on_signout,
+                self._on_edit_request, self._on_cancel, self._on_end_now
+            )
+            # This ties the persistent view to that exact message id
+            self.bot.add_view(view, message_id=message_id)
+
     async def _create_event_common(self, interaction: discord.Interaction, name: str, start_time: str, duration_str: str, target_channel: Optional[discord.TextChannel] = None):
         await ensure_tables(settings.SQLITE_PATH)
         event_start_utc = local_str_to_utc(start_time, "%Y-%m-%d %H:%M")
@@ -178,6 +321,8 @@ class EventsCog(commands.Cog):
             self._on_edit_request, self._on_cancel, self._on_end_now
         )
         await msg.edit(view=view)
+        # Register the persistent view for this specific message so it survives restarts
+        self.bot.add_view(view, message_id=msg.id)
 
         await self.event_repo.create(name, interaction.user.id, channel.id, event_start_utc.isoformat(), event_end_utc.isoformat(), msg.id)
 
@@ -271,7 +416,7 @@ class EventsCog(commands.Cog):
     async def _start_event(self, name: str, channel_id: int):
         ch = self.bot.get_channel(channel_id)
         if ch:
-            await ch.send(f"🚀 **Event '{name}'** has started! Start logging those kills!")
+            await ch.send(f"📢 **Event '{name}'** has started!")
 
         # DM all signed-up users “starting now”
         try:
@@ -286,7 +431,18 @@ class EventsCog(commands.Cog):
         except Exception:
             pass
 
+        # Ensure a session exists (may be missing after reboot)
         sess = active_sessions.get((name, channel_id))
+        if not sess:
+            row = await _get_event_row(settings.SQLITE_PATH, name, channel_id)
+            if row:
+                _, _n, _creator, _ch, start_iso, end_iso, _msg = row
+                start_dt = self._parse_iso_utc(start_iso)
+                end_dt = self._parse_iso_utc(end_iso)
+                if start_dt and end_dt and settings.LOG_DIR and os.path.isdir(settings.LOG_DIR):
+                    sess = EventSession(name, start_dt, end_dt, channel_id, settings.LOG_DIR)
+                    active_sessions[(name, channel_id)] = sess
+
         if sess:
             sess.start_task()
 
@@ -297,48 +453,70 @@ class EventsCog(commands.Cog):
             ephemeral=True
         )
 
-    async def _end_event(self, name: str, channel_id: int, end_override_utc: Optional[datetime.datetime] = None):
-
+    async def _end_event(self, name: str, channel_id: int, end_override_utc: datetime.datetime | None = None):
         ch = self.bot.get_channel(channel_id)
         sess = active_sessions.pop((name, channel_id), None)
-        if sess:
-            await sess.stop_task()
-            event_end_for_summary = end_override_utc or sess.end
+
+        # Pull event window from DB (so Summary has start/end even after reboot)
+        row = await _get_event_row(settings.SQLITE_PATH, name, channel_id)
+        start_dt = end_dt = None
+        if row:
+            _, _n, _creator, _ch, start_iso, end_iso, _msg = row
+            start_dt = self._parse_iso_utc(start_iso)
+            end_dt = self._parse_iso_utc(end_iso)
+
+        # If caller provided an override (e.g., End Now), honor it
+        if end_override_utc:
+            end_dt = end_override_utc
+
+        # Let users know we’re finalizing no matter what happens next
+        if ch:
+            await ch.send(f"✅ **Event '{name}'** has ended. I’m finalizing uploads… (a few minutes)")
+
+        # --- Ensure analytics tables & rows exist BEFORE any summary helper touches them
+        try:
+            await ensure_enriched_for_event(name)
+        except Exception as e:
             if ch:
-                if sess.results:
-                    summary_embed = await build_summary_embed(
-                        name, sess.results,
-                        event_start_utc=sess.start,
-                        event_end_utc=event_end_for_summary
-                    )
-                    await ch.send(f"✅ **Event '{name}'** has ended. Processing logs and generating summary...")
-                    await ch.send(embed=summary_embed)
-                else:
-                    await ch.send(f"✅ **Event '{name}'** has ended. I’m finalizing uploads… (a few minutes)")
-                # Try analytics from what we have now
-                _ = await ensure_enriched_for_event(name)
-                try:
-                    embeds = await build_event_analytics_embeds(name)
-                    if embeds:
-                        for em in embeds:
-                            await ch.send(embed=em)
-                except Exception as e:
-                    await ch.send(f"⚠️ Analytics failed: `{e}`")
-        # Whether we had a session or not, try a DB-based summary now:
+                await ch.send(f"⚠️ Analytics bootstrap failed: `{e}`")
+
+        # --- Build and post the event summary
         try:
-            await self._post_finalize_from_db(name, channel_id)
-        except Exception:
-            pass
-        # And schedule a re-check in 5 minutes to catch pending uploads
+            if sess:
+                # live session path
+                await sess.stop_task()
+                summary_embed = await build_summary_embed(
+                    name,
+                    sess.results,
+                    event_start_utc=start_dt or sess.start,
+                    event_end_utc=end_dt or sess.end,
+                )
+            else:
+                # fallback path (post-reboot or no session) - reconstruct from DB
+                results = await self._load_results_for_summary(name)
+                safe_end = end_dt or datetime.datetime.now(datetime.timezone.utc)
+                summary_embed = await build_summary_embed(
+                    name,
+                    results,
+                    event_start_utc=start_dt,
+                    event_end_utc=safe_end,
+                )
+
+            if ch and summary_embed:
+                await ch.send(embed=summary_embed)
+        except Exception as e:
+            if ch:
+                await ch.send(f"⚠️ Summary failed: `{e}`")
+
+        # --- Post analytics embeds (optional)
         try:
-            run_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5)
-            scheduler.add_job(self._post_finalize_from_db, 'date',
-                              id=f"finalize:{name}:{channel_id}",
-                              replace_existing=True,
-                              run_date=run_at,
-                              args=[name, channel_id])
-        except Exception:
-            pass
+            embeds = await build_event_analytics_embeds(name)
+            if ch and embeds:
+                for em in embeds:
+                    await ch.send(embed=em)
+        except Exception as e:
+            if ch:
+                await ch.send(f"⚠️ Analytics failed: `{e}`")
 
     async def _is_owner_or_admin(self, interaction: discord.Interaction, event_creator_id: int) -> bool:
         if interaction.user.id == event_creator_id:
@@ -390,6 +568,7 @@ class EventsCog(commands.Cog):
 
     async def _on_edit_submit(self, interaction: discord.Interaction, event_name: str, new_start_str: str,
                               new_duration_str: str):
+        await interaction.response.defer(ephemeral=True)
         # Compute new start/end (local -> UTC), reschedule jobs, update DB and message embed, replace view
         def parse_duration(s: str) -> datetime.timedelta | None:
             s = s.lower().replace(" ", "")
@@ -463,9 +642,10 @@ class EventsCog(commands.Cog):
         except Exception:
             pass
 
-        await interaction.response.send_message("✅ Event updated.", ephemeral=True)
+        await interaction.followup.send("✅ Event updated.", ephemeral=True)
 
     async def _on_cancel(self, interaction: discord.Interaction, view: EventMessageView):
+        await interaction.response.defer(ephemeral=True)
         row = await _get_event_row(settings.SQLITE_PATH, view.event_name, view.channel_id)
         if not row:
             await interaction.response.send_message("Event not found.", ephemeral=True)
@@ -499,9 +679,10 @@ class EventsCog(commands.Cog):
         except Exception:
             pass
 
-        await interaction.response.send_message("🛑 Event cancelled.", ephemeral=True)
+        await interaction.followup.send("🛑 Event cancelled.", ephemeral=True)
 
     async def _on_end_now(self, interaction: discord.Interaction, view: EventMessageView):
+        await interaction.response.defer(ephemeral=True)
         row = await _get_event_row(settings.SQLITE_PATH, view.event_name, view.channel_id)
         if not row:
             await interaction.response.send_message("Event not found.", ephemeral=True);
@@ -526,7 +707,7 @@ class EventsCog(commands.Cog):
 
         # End immediately with correct end time in the summary
         await self._end_event(view.event_name, view.channel_id, end_override_utc=end_now)
-        await interaction.response.send_message("⏹️ Event ended.", ephemeral=True)
+        await interaction.followup.send("⏹️ Event ended.", ephemeral=True)
 
     async def _post_finalize_from_db(self, name: str, channel_id: int):
         from repos.sqlite_repo import SqliteUploadRepo
