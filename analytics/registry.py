@@ -59,10 +59,10 @@ ENCOUNTER_WINGS_BY_NAME = {
 
 # IMPORTANT: enrichment should match mechanics by exact (normalized) alias, not substring.
 ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
-    # "vale guardian": [
-    #     {"key": "Boss TP", "label": "Blue ports",
-    #      "exact": ["Boss TP", "Boss Teleport"], "modes": ["occurrences", "occurrences"]},
-    # ],
+    "vale guardian": [
+        {"key": "Boss TP", "label": "Blue ports",
+         "exact": ["Boss TP", "Boss Teleport"], "modes": ["occurrences", "occurrences"]},
+    ],
     "gorseval the multifarious": [
         {"key": "Egg", "label": "Eggs",
          "exact": ["Egg", "Egged"], "modes": ["occurrences", "occurrences"]},
