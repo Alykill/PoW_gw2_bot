@@ -14,6 +14,7 @@ ENCOUNTER_WINGS_BY_NAME = {
     "vale guardian": "W1",
     "spirit race": "W1",
     "gorseval": "W1",
+    "gorseval the multifarious": "W1",   # alias seen in some exports
     "sabetha the saboteur": "W1",
 
     # Wing 2 — Salvation Pass
@@ -56,11 +57,12 @@ ENCOUNTER_WINGS_BY_NAME = {
     "ura": "W8",
 }
 
+# IMPORTANT: enrichment should match mechanics by exact (normalized) alias, not substring.
 ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
-    "vale guardian": [
-        {"key": "Boss TP", "label": "Blue ports",
-         "exact": ["Boss TP", "Boss Teleport"], "modes": ["occurrences"]},
-    ],
+    # "vale guardian": [
+    #     {"key": "Boss TP", "label": "Blue ports",
+    #      "exact": ["Boss TP", "Boss Teleport"], "modes": ["occurrences", "occurrences"]},
+    # ],
     "gorseval the multifarious": [
         {"key": "Egg", "label": "Eggs",
          "exact": ["Egg", "Egged"], "modes": ["occurrences", "occurrences"]},
@@ -88,66 +90,72 @@ ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
          "exact": ["Schk.Wv", "Shockwave from Spears"], "modes": ["occurrences", "occurrences"]},
     ],
     "deimos": [
-        {"key": "Oil T.", "label": "Oil Trigger",
-         "exact": ["Oil T.", "Black Oil Trigger"], "modes": ["occurrences"]},
+        {"key": "Oil T.", "label": "Oil Trigger",                # ONLY the Oil Trigger
+         "exact": ["Oil T."], "modes": ["occurrences"]},
+        {"key": "black_oil_trigger", "label": "Black Oil Trigger",  # separate from Oil T.
+         "exact": ["Black Oil Trigger"], "modes": ["occurrences"]},
         {"key": "Pizza", "label": "Pizza",
-         "exact": ["Pizza", "Cascading Pizza attack"], "modes": ["occurrences"]},
+         "exact": ["Pizza", "Cascading Pizza attack"], "modes": ["occurrences", "occurrences"]},
     ],
     "soulless horror": [
-        {"key": "scythe", "label": "Scythed",
-         "exact": ["Scythe", "Spinning Slash"], "modes": ["occurrences"]},
+        {
+            "key": "scythe",
+            "label": "Scythed",
+            "exact": ["Scythe", "Spinning Slash"],
+            "modes": ["hits", "hits"],  # count every record
+            "force_per_hit": True  # never fall back to 'players'
+        },
     ],
     "statue of darkness": [
         {"key": "hard_cc_judge", "label": "CC'ed",
-         "exact": ["Hard CC Judge", "CC Judge"], "modes": ["occurrences"]},
+         "exact": ["Hard CC Judge", "CC Judge"], "modes": ["occurrences", "occurrences"]},
     ],
     "dhuum": [
         {"key": "dhuum_dip", "label": "Dip AoE",
-         "exact": ["Dip", "Dip AoE"], "modes": ["occurrences"]},
+         "exact": ["Dip", "Dip AoE"], "canonical": "dhuum_dip", "dedup_ms": 5000},
         {"key": "crack", "label": "Stood in Cracks",
-         "exact": ["Crack", "Cull (Fearing Fissure)"], "modes": ["occurrences"]},
+         "exact": ["Crack", "Cull (Fearing Fissure)"], "modes": ["occurrences", "occurrences"]},
         {"key": "rending_swipe_hit", "label": "Swiped",
-         "exact": ["Enf.Swipe", "Rending Swipe Hit"], "modes": ["occurrences"]},
+         "exact": ["Enf.Swipe", "Rending Swipe Hit"], "modes": ["occurrences", "occurrences"]},
     ],
     "conjured amalgamate": [
-        {"key": "arm_slam", "label": "Arm Slammed",
-         "exact": ["Arm Slam", "Arm Slam: Pulverize"], "modes": ["occurrences"]},
+        {"key": "arm_slam", "label": "Arm Slammed",  # do NOT match 'Tremor'
+         "exact": ["Arm Slam", "Arm Slam: Pulverize"], "modes": ["occurrences", "occurrences"]},
     ],
     "twin largos": [
         {"key": "float", "label": "Bubbled",
-         "exact": ["Float", "Float Bubble"], "modes": ["hits"]},
+        "exact": ["Float", "Float Bubble"], "modes": ["occurrences", "occurrences"], "dedup_ms": 2500},
         {"key": "steal", "label": "Boon Steal",
-         "exact": ["Steal", "Boon Steal"], "modes": ["occurrences"]},
+        "exact": ["Steal", "Boon Steal"], "modes": ["occurrences"]},
     ],
     "qadim": [
         {"key": "qadim_hitbox_aoe", "label": "Stood in Qadim hitbox",
-         "exact": ["Q.Hitbox", "Qadim Hitbox AoE"], "modes": ["occurrences"]},
+         "exact": ["Q.Hitbox", "Qadim Hitbox AoE"], "modes": ["occurrences", "occurrences"]},
     ],
     "cardinal adina": [
         {"key": "radiant_blindness", "label": "Blinded",
-         "exact": ["R.Blind", "Radiant Blindness"], "modes": ["occurrences"]},
+         "exact": ["R.Blind", "Radiant Blindness"], "modes": ["occurrences", "occurrences"]},
     ],
     "cardinal sabir": [
         {"key": "shockwave", "label": "Shockwaved",
-         "exact": ["Shockwave", "Shockwave Hit"], "modes": ["occurrences"]},
+         "exact": ["Shockwave", "Shockwave Hit"], "modes": ["occurrences", "occurrences"]},
         {"key": "pushed", "label": "Pushed during CC",
-         "exact": ["Pushed", "Pushed by rotating breakbar"], "modes": ["occurrences"]},
+         "exact": ["Pushed", "Pushed by rotating breakbar"], "modes": ["occurrences", "occurrences"]},
     ],
     "qadim the peerless": [
         {"key": "qtp_knckpll", "label": "Knocked Back/Pulled",
-         "exact": ["Knck.Pll", "Knocked Back/Pulled"], "modes": ["occurrences"]},
+         "exact": ["Knck.Pll", "Knocked Back/Pulled"], "modes": ["occurrences", "occurrences"]},
         {"key": "qtp_lightning", "label": "Hit by Expanding Lightning",
-         "exact": ["Lght.H", "Lightning Hit"], "modes": ["occurrences"]},
+         "exact": ["Lght.H", "Lightning Hit"], "modes": ["occurrences", "occurrences"]},
         {"key": "qtp_small_lightning", "label": "Hit by Small Lightning",
-         "exact": ["S.Lght.H", "Small Lightning Hit"], "modes": ["occurrences"]},
+         "exact": ["S.Lght.H", "Small Lightning Hit"], "modes": ["occurrences", "occurrences"]},
         {"key": "qtp_magma", "label": "Stood in Magma Field",
-         "exact": ["Magma.F", "Magma Field"], "modes": ["occurrences"]},
+         "exact": ["Magma.F", "Magma Field"], "modes": ["occurrences", "occurrences"]},
         {"key": "qtp_small_magma", "label": "Stood in Lightning fire puddle",
-         "exact": ["S.Magma.F", "Small Magma Field"], "modes": ["occurrences", "hits"]},
+         "exact": ["S.Magma.F", "Small Magma Field"], "modes": ["occurrences", "occurrences"]},
         {"key": "pylon_magma", "label": "Stood in Pylon fire",
-         "exact": ["P.Magma", "Pylon Magma"], "modes": ["occurrences"]},
+         "exact": ["P.Magma", "Pylon Magma"], "modes": ["occurrences", "occurrences"]},
         {"key": "dome_knockback", "label": "Pylon knockback",
-         "exact": ["Dome.KB", "Dome Knockback"], "modes": ["occurrences"]},
+         "exact": ["Dome.KB", "Dome Knockback"], "modes": ["occurrences", "occurrences"]},
     ],
 }
-
