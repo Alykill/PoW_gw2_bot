@@ -473,6 +473,19 @@ class EventsCog(commands.Cog):
         if ch:
             await ch.send(f"✅ **Event '{name}'** has ended. I’m finalizing uploads… (a few minutes)")
 
+        # ✅ Ensure core DB schema exists (events/uploads/signups/etc.) before analytics touch 'uploads'
+        try:
+            await ensure_tables(settings.SQLITE_PATH)
+        except Exception as e:
+            if ch:
+                await ch.send(f"⚠️ DB init failed: `{e}`")
+
+        # (optional but helpful) force one last pass to ingest any logs that finished right at the end
+        try:
+            await process_pending_uploads()
+        except Exception:
+            pass
+
         # --- Ensure analytics tables & rows exist BEFORE any summary helper touches them
         try:
             await ensure_enriched_for_event(name)

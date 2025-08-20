@@ -517,7 +517,7 @@ async def build_summary_embed(
 
     award_lines = [
         _fmt_award("🪦 Pleb", deaths_tied, deaths_max),
-        _fmt_award("🫦 Chinese hooker", downs_tied, downs_max),
+        _fmt_award("🫦 Sleepr", downs_tied, downs_max),
         _fmt_award("💉 Medic", medic_tied, medic_max),
     ]
     em.add_field(name="✨ Session stars ✨", value="\n".join(award_lines), inline=False)
