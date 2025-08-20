@@ -11,9 +11,12 @@ from ui.embeds import build_summary_embed
 from repos.sqlite_repo import ensure_tables, SqliteEventRepo, SqliteSignupRepo
 from services.session import EventSession
 from services.upload_service import process_pending_uploads
-from analytics.service import ensure_enriched_for_event, build_event_analytics_embeds
-
-# test
+from analytics.service import (
+    ensure_enriched_for_event,
+    build_event_analytics_embeds,
+    _coerce_payload_to_json,
+    enrich_upload,
+)
 
 log = logging.getLogger("events")
 
@@ -50,6 +53,25 @@ def parse_duration(duration_str: str) -> Optional[datetime.timedelta]:
         return None
     return datetime.timedelta(hours=h, minutes=m)
 
+def is_metrics_role(*, role_ids: set[int] = set(), role_names: set[str] = {"raid leader"}):
+    """
+    Passes only if the invoker has ANY of the given roles.
+    No Administrator bypass.
+    Role-name checks are case-insensitive.
+    """
+    lowered = {n.lower() for n in role_names}
+
+    def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            raise app_commands.CheckFailure("Run this in a server, not DMs.")
+        roles = getattr(interaction.user, "roles", [])
+        if any(r.id in role_ids for r in roles):
+            return True
+        if any((r.name or "").lower() in lowered for r in roles):
+            return True
+        raise app_commands.MissingPermissions(["required role"])
+    return app_commands.check(predicate)
+
 # active sessions keyed by (event_name, channel_id)
 active_sessions: Dict[Tuple[str, int], EventSession] = {}
 
@@ -85,16 +107,7 @@ class EventsCog(commands.Cog):
         log.info("EventsCog ready")
         try:
             await self._rehydrate_jobs()
-            log.info("Rehydrated scheduled jobs from DB (start/end/reminders + sessions)")
-        except Exception as e:
-            log.exception(f"Rehydrate failed: {e}")
-
-    @commands.Cog.listener()
-    async def on_ready(self):
-        log.info("EventsCog ready")
-        try:
-            await self._rehydrate_jobs()
-            await self._rehydrate_views()  # <-- add this line
+            await self._rehydrate_views()
             log.info("Rehydrated scheduled jobs and views")
         except Exception as e:
             log.exception(f"Rehydrate failed: {e}")
@@ -109,11 +122,234 @@ class EventsCog(commands.Cog):
     async def slash_event_panel(self, interaction: discord.Interaction):
         await self._send_event_panel(interaction)
 
-    @app_commands.command(name="reprocess_pending", description="Admin: process pending uploads now")
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.command(name="reprocess_pending", description="Process pending uploads now")
     async def reprocess_pending(self, interaction: discord.Interaction):
         await process_pending_uploads()
         await interaction.response.send_message("Pending uploads processed.", ephemeral=True)
+
+    # ---- /import_log_event ----
+    @app_commands.guild_only()
+    @is_metrics_role(role_names={"Raid Leader"})  # role-only
+    @app_commands.command(
+        name="import_log_event",
+        description="Attach one or more dps.report links to an event and post Summary & Analytics."
+    )
+    async def import_log_event(
+            self,
+            interaction: discord.Interaction,
+            event_name: str,
+            permalinks: str,  # paste one or many URLs separated by spaces/commas/newlines
+            channel: Optional[discord.TextChannel] = None,
+            use_log_time: bool = True,
+    ):
+        """Create (or reuse) an event, import EI reports into it, enrich, and post embeds."""
+        await interaction.response.defer(ephemeral=True)
+
+        # 0) Parse URLs
+        urls = [u for u in re.split(r"[,\s]+", (permalinks or "").strip()) if u]
+        urls = list(dict.fromkeys(urls))  # de-dupe keep order
+        if not urls:
+            await interaction.followup.send("❌ No valid URLs provided.", ephemeral=True)
+            return
+
+        imported: list[tuple[str, int]] = []  # (boss_name, upload_id)
+        boss_names: list[str] = []
+        earliest: Optional[datetime.datetime] = None
+        latest: Optional[datetime.datetime] = None
+
+        # helper to parse EI ISO-ish timestamps safely
+        def _parse_ts(s: Optional[str]) -> Optional[datetime.datetime]:
+            if not s:
+                return None
+            s = s.replace("Z", "+00:00").replace(" UTC", "+00:00")
+            try:
+                dt = datetime.datetime.fromisoformat(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+                return dt.astimezone(datetime.timezone.utc)
+            except Exception:
+                return None
+
+        # 1) Ensure event row exists (message_id=0 is fine)
+        ch = channel or interaction.channel  # type: ignore
+        assert isinstance(ch, discord.TextChannel)
+        async with aiosqlite.connect(settings.SQLITE_PATH) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO events (name, user_id, channel_id, start_time, end_time, message_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (event_name, interaction.user.id, ch.id,
+                 (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=1)).isoformat(),
+                 (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=8)).isoformat(),
+                 0),
+            )
+            await db.commit()
+
+        # 2) For each permalink: fetch JSON, extract info, insert/attach upload
+        for url in urls:
+            try:
+                j = await _coerce_payload_to_json(url)
+            except Exception as e:
+                boss_names.append(f"(load failed: {url})")
+                continue
+
+            enc = (j.get("encounter") or {})
+            boss_name = str(enc.get("boss") or j.get("boss") or j.get("fightName") or "Unknown Encounter")
+            boss_id = int(enc.get("bossId") or -1)
+            success = 1 if bool(enc.get("success")) else 0
+
+            start_dt = _parse_ts(j.get("timeStartStd")) or _parse_ts(j.get("timeStart"))
+            end_dt = _parse_ts(j.get("timeEndStd")) or _parse_ts(j.get("timeEnd"))
+            # fallback times if EI didn’t provide them
+            if not start_dt:
+                start_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=1)
+            if not end_dt:
+                end_dt = start_dt + datetime.timedelta(minutes=8)
+
+            earliest = min(earliest, start_dt) if earliest else start_dt
+            latest = max(latest, end_dt) if latest else end_dt
+
+            async with aiosqlite.connect(settings.SQLITE_PATH) as db:
+                # avoid duplicate uploads by permalink
+                cur = await db.execute("SELECT id FROM uploads WHERE permalink = ?", (url,))
+                row = await cur.fetchone()
+                if row:
+                    upload_id = int(row[0])
+                    await db.execute("UPDATE uploads SET event_name = ? WHERE id = ?", (event_name, upload_id))
+                else:
+                    cur = await db.execute(
+                        """
+                        INSERT INTO uploads (event_name, boss_id, boss_name, success, permalink, file_path, time_utc)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (event_name, boss_id, boss_name, success, url, None, start_dt.isoformat()),
+                    )
+                    upload_id = int(cur.lastrowid or 0)
+                await db.commit()
+
+            imported.append((boss_name, upload_id))
+            boss_names.append(boss_name)
+
+        # 3) Expand event time range to cover all logs (optional)
+        if use_log_time and (earliest and latest):
+            try:
+                async with aiosqlite.connect(settings.SQLITE_PATH) as db:
+                    await db.execute(
+                        """
+                        UPDATE events
+                        SET start_time = CASE
+                            WHEN start_time IS NULL THEN ?
+                            WHEN datetime(start_time) > datetime(?) THEN ?
+                            ELSE start_time END,
+                            end_time = CASE
+                            WHEN end_time IS NULL THEN ?
+                            WHEN datetime(end_time) < datetime(?) THEN ?
+                            ELSE end_time END
+                        WHERE name = ? AND channel_id = ?
+                        """,
+                        (earliest.isoformat(), earliest.isoformat(), earliest.isoformat(),
+                         latest.isoformat(), latest.isoformat(), latest.isoformat(),
+                         event_name, ch.id)
+                    )
+                    await db.commit()
+            except Exception:
+                pass
+
+        # 4) Enrich newly added uploads (only those with no metrics)
+        try:
+            _ = await ensure_enriched_for_event(event_name)
+        except Exception as e:
+            await interaction.followup.send(f"⚠️ Enrichment warning: `{e}`", ephemeral=True)
+
+        # 5) Post Summary & Analytics
+        try:
+            results = await self._load_results_for_summary(event_name)
+            summary = await build_summary_embed(
+                event_name,
+                results,
+                event_start_utc=earliest or datetime.datetime.now(datetime.timezone.utc),
+                event_end_utc=latest or (earliest or datetime.datetime.now(datetime.timezone.utc)) + datetime.timedelta(
+                    minutes=8),
+            )
+            await ch.send(embed=summary)
+
+            analytics = await build_event_analytics_embeds(event_name)
+            for em in analytics:
+                await ch.send(embed=em)
+        except Exception as e:
+            await ch.send(f"⚠️ Posting failed: `{e}`")
+
+        # 6) Ephemeral ack
+        ok = sum(1 for _, uid in imported if uid)
+        await interaction.followup.send(
+            f"✅ Imported **{ok}/{len(urls)}** logs into **{event_name}**.\n"
+            f"Bosses: {', '.join(boss_names)}",
+            ephemeral=True
+        )
+
+    # ---- /rebuild_metrics ----
+    @app_commands.guild_only()
+    @is_metrics_role(role_names={"Raid Leader"})  # role-only
+    @app_commands.command(
+        name="rebuild_metrics",
+        description="Re-enrich EI metrics for an event and (optionally) repost Summary & Analytics."
+    )
+    async def rebuild_metrics(
+        self,
+        interaction: discord.Interaction,
+        event_name: str,
+        repost: bool = True,
+        channel: Optional[discord.TextChannel] = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        # Re-enrich ALL uploads for this event
+        processed = 0
+        failed = 0
+        async with aiosqlite.connect(settings.SQLITE_PATH) as db:
+            cur = await db.execute("""
+                SELECT id, COALESCE(NULLIF(permalink, ''), file_path) AS src
+                FROM uploads
+                WHERE event_name = ?
+                ORDER BY datetime(time_utc) ASC
+            """, (event_name,))
+            rows = await cur.fetchall()
+
+        for upload_id, src in rows:
+            try:
+                await enrich_upload(int(upload_id), str(src or ""))
+                processed += 1
+            except Exception:
+                failed += 1
+
+        posted = False
+        if repost:
+            try:
+                target = channel or interaction.channel  # type: ignore
+                results = await self._load_results_for_summary(event_name)
+                summary_embed = await build_summary_embed(event_name, results)
+                if summary_embed and isinstance(target, discord.TextChannel):
+                    await target.send(embed=summary_embed)
+
+                analytics_embeds = await build_event_analytics_embeds(event_name)
+                if analytics_embeds and isinstance(target, discord.TextChannel):
+                    for em in analytics_embeds:
+                        await target.send(embed=em)
+                posted = True
+            except Exception as e:
+                await interaction.followup.send(
+                    f"✅ Rebuilt metrics for **{event_name}**. Re-enriched {processed} upload(s)"
+                    + (f", {failed} failed" if failed else "")
+                    + f". ⚠️ Couldn’t repost Summary/Analytics: `{e}`",
+                    ephemeral=True,
+                )
+                return
+
+        msg = f"✅ Rebuilt metrics for **{event_name}**. Re-enriched {processed} upload(s)"
+        if failed:
+            msg += f", {failed} failed"
+        if repost:
+            msg += " — posted updated Summary & Analytics." if posted else " — nothing to repost."
+        await interaction.followup.send(msg, ephemeral=True)
 
     # -------- Legacy prefix command (optional) --------
     @commands.command(name="event_panel")
@@ -121,90 +357,6 @@ class EventsCog(commands.Cog):
         await ctx.send("Use the button to create a new event:", view=EventCreatorView(self._open_modal))
 
     # -------- Internal handlers --------
-
-    # --- Add near top of EventsCog (utilities) ---
-    def _parse_iso_utc(self, s: str | None) -> datetime.datetime | None:
-        if not s:
-            return None
-        try:
-            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=datetime.timezone.utc)
-            return dt.astimezone(datetime.timezone.utc)
-        except Exception:
-            return None
-
-    async def _rehydrate_jobs(self):
-        """
-        On bot startup, reconstruct start/end jobs, resume active sessions for
-        in-progress events, and (re)schedule T-15 reminders for signups.
-        """
-        await ensure_tables(settings.SQLITE_PATH)
-        now = datetime.datetime.now(datetime.timezone.utc)
-
-        async with aiosqlite.connect(settings.SQLITE_PATH) as db:
-            # events to consider (future or ongoing)
-            cur = await db.execute("""
-                SELECT name, user_id, channel_id, start_time, end_time, message_id
-                FROM events
-            """)
-            rows = await cur.fetchall()
-
-            for name, creator_id, channel_id, start_iso, end_iso, message_id in rows:
-                start_dt = self._parse_iso_utc(start_iso)
-                end_dt = self._parse_iso_utc(end_iso)
-                if not start_dt or not end_dt:
-                    continue
-                if end_dt <= now:
-                    # Already in the past; nothing to schedule
-                    continue
-
-                # Always schedule (or reschedule) the END job
-                try:
-                    scheduler.remove_job(f"end:{name}:{channel_id}")
-                except Exception:
-                    pass
-                scheduler.add_job(
-                    self._end_event, 'date',
-                    id=f"end:{name}:{channel_id}", replace_existing=True,
-                    run_date=end_dt, args=[name, channel_id]
-                )
-
-                if now < start_dt:
-                    # Future event → schedule START
-                    try:
-                        scheduler.remove_job(f"start:{name}:{channel_id}")
-                    except Exception:
-                        pass
-                    scheduler.add_job(
-                        self._start_event, 'date',
-                        id=f"start:{name}:{channel_id}", replace_existing=True,
-                        run_date=start_dt, args=[name, channel_id]
-                    )
-
-                    # Re-schedule T-15 reminders for existing signups
-                    cur2 = await db.execute(
-                        "SELECT user_id FROM signups WHERE event_name = ?", (name,)
-                    )
-                    for (uid,) in await cur2.fetchall():
-                        remind_at = start_dt - datetime.timedelta(minutes=15)
-                        if remind_at > now:
-                            scheduler.add_job(
-                                send_dm_reminder, 'date',
-                                id=f"reminder:{uid}:{name}", replace_existing=True,
-                                run_date=remind_at,
-                                args=[self.bot, int(uid), name, start_dt]
-                            )
-                        # else: inside 15m window; skip auto-DM on boot to avoid spam
-                else:
-                    # In-progress event → create session and ensure the END is scheduled
-                    if settings.LOG_DIR and os.path.isdir(settings.LOG_DIR):
-                        active_sessions[(name, channel_id)] = EventSession(
-                            name, start_dt, end_dt, channel_id, settings.LOG_DIR
-                        )
-                        # Start the watcher immediately
-                        active_sessions[(name, channel_id)].start_task()
-
     async def _load_results_for_summary(self, event_name: str) -> List[dict]:
         """
         Build a minimal 'results' array from DB so build_summary_embed works
@@ -228,53 +380,82 @@ class EventsCog(commands.Cog):
                     "boss": boss_name or "Unknown Encounter",
                     "success": bool(success),
                 },
-                # build_summary_embed will enrich duration from permalink if needed
                 "permalink": src or "",
                 "timeStart": time_utc or "",
             })
         return results
 
-    async def _open_modal(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(CreateEventModal(self._handle_create_submit))
-
-    async def _handle_create_submit(self, interaction: discord.Interaction, name: str, start: str, duration: str):
+    def _parse_iso_utc(self, s: str | None) -> datetime.datetime | None:
+        if not s:
+            return None
         try:
-            if not settings.LOG_DIR:
-                await interaction.response.send_message("❌ `LOG_DIR` is not set in `.env`.", ephemeral=True)
-                return
+            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            return dt.astimezone(datetime.timezone.utc)
+        except Exception:
+            return None
 
-            # Step 2: Ephemeral channel picker
-            await interaction.response.send_message(
-                f"Pick a channel to post **{name}**:",
-                view=EventFinalizeView(name, start, duration, self._finalize_event_creation),
-                ephemeral=True
-            )
-        except ValueError as e:
-            await interaction.response.send_message(f"❌ {e}", ephemeral=True)
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Unexpected error: {e}", ephemeral=True)
+    async def _rehydrate_jobs(self):
+        """
+        On bot startup, reconstruct start/end jobs, resume active sessions for
+        in-progress events, and (re)schedule T-15 reminders for signups.
+        """
+        await ensure_tables(settings.SQLite_PATH if hasattr(settings, "SQLite_PATH") else settings.SQLITE_PATH)
+        now = datetime.datetime.now(datetime.timezone.utc)
 
-    async def _finalize_event_creation(self, interaction: discord.Interaction, view: EventFinalizeView):
-        # Resolve channel from stored ID
-        ch = interaction.client.get_channel(view.selected_channel_id) or await interaction.client.fetch_channel(
-            view.selected_channel_id)
-        if not isinstance(ch, discord.TextChannel):
-            await interaction.followup.send("Selected channel is not a text channel.", ephemeral=True)
-            return
+        async with aiosqlite.connect(settings.SQLITE_PATH) as db:
+            cur = await db.execute("""
+                SELECT name, user_id, channel_id, start_time, end_time, message_id
+                FROM events
+            """)
+            rows = await cur.fetchall()
 
-        created = await self._create_event_common(
-            interaction,
-            view.name,
-            view.start,
-            view.duration,
-            target_channel=ch
-        )
+            for name, creator_id, channel_id, start_iso, end_iso, message_id in rows:
+                start_dt = self._parse_iso_utc(start_iso)
+                end_dt = self._parse_iso_utc(end_iso)
+                if not start_dt or not end_dt:
+                    continue
+                if end_dt <= now:
+                    continue
 
-        # ✅ We deferred already; use followup to send the ephemeral confirmation
-        await interaction.followup.send(
-            f"✅ Event **{created}** created in {ch.mention}.",
-            ephemeral=True
-        )
+                try:
+                    scheduler.remove_job(f"end:{name}:{channel_id}")
+                except Exception:
+                    pass
+                scheduler.add_job(
+                    self._end_event, 'date',
+                    id=f"end:{name}:{channel_id}", replace_existing=True,
+                    run_date=end_dt, args=[name, channel_id]
+                )
+
+                if now < start_dt:
+                    try:
+                        scheduler.remove_job(f"start:{name}:{channel_id}")
+                    except Exception:
+                        pass
+                    scheduler.add_job(
+                        self._start_event, 'date',
+                        id=f"start:{name}:{channel_id}", replace_existing=True,
+                        run_date=start_dt, args=[name, channel_id]
+                    )
+
+                    cur2 = await db.execute("SELECT user_id FROM signups WHERE event_name = ?", (name,))
+                    for (uid,) in await cur2.fetchall():
+                        remind_at = start_dt - datetime.timedelta(minutes=15)
+                        if remind_at > now:
+                            scheduler.add_job(
+                                send_dm_reminder, 'date',
+                                id=f"reminder:{uid}:{name}", replace_existing=True,
+                                run_date=remind_at,
+                                args=[self.bot, int(uid), name, start_dt]
+                            )
+                else:
+                    if settings.LOG_DIR and os.path.isdir(settings.LOG_DIR):
+                        active_sessions[(name, channel_id)] = EventSession(
+                            name, start_dt, end_dt, channel_id, settings.LOG_DIR
+                        )
+                        active_sessions[(name, channel_id)].start_task()
 
     async def _rehydrate_views(self):
         """Re-register persistent views for all not-yet-ended events so buttons work after reboot."""
@@ -293,8 +474,42 @@ class EventsCog(commands.Cog):
                 self._on_signup, self._on_signout,
                 self._on_edit_request, self._on_cancel, self._on_end_now
             )
-            # This ties the persistent view to that exact message id
             self.bot.add_view(view, message_id=message_id)
+
+    async def _open_modal(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(CreateEventModal(self._handle_create_submit))
+
+    async def _handle_create_submit(self, interaction: discord.Interaction, name: str, start: str, duration: str):
+        try:
+            if not settings.LOG_DIR:
+                await interaction.response.send_message("❌ `LOG_DIR` is not set in `.env`.", ephemeral=True)
+                return
+
+            await interaction.response.send_message(
+                f"Pick a channel to post **{name}**:",
+                view=EventFinalizeView(name, start, duration, self._finalize_event_creation),
+                ephemeral=True
+            )
+        except ValueError as e:
+            await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Unexpected error: {e}", ephemeral=True)
+
+    async def _finalize_event_creation(self, interaction: discord.Interaction, view: EventFinalizeView):
+        ch = interaction.client.get_channel(view.selected_channel_id) or await interaction.client.fetch_channel(view.selected_channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            await interaction.followup.send("Selected channel is not a text channel.", ephemeral=True)
+            return
+
+        created = await self._create_event_common(
+            interaction,
+            view.name,
+            view.start,
+            view.duration,
+            target_channel=ch
+        )
+
+        await interaction.followup.send(f"✅ Event **{created}** created in {ch.mention}.", ephemeral=True)
 
     async def _create_event_common(self, interaction: discord.Interaction, name: str, start_time: str, duration_str: str, target_channel: Optional[discord.TextChannel] = None):
         await ensure_tables(settings.SQLITE_PATH)
@@ -321,7 +536,6 @@ class EventsCog(commands.Cog):
             self._on_edit_request, self._on_cancel, self._on_end_now
         )
         await msg.edit(view=view)
-        # Register the persistent view for this specific message so it survives restarts
         self.bot.add_view(view, message_id=msg.id)
 
         await self.event_repo.create(name, interaction.user.id, channel.id, event_start_utc.isoformat(), event_end_utc.isoformat(), msg.id)
@@ -366,7 +580,6 @@ class EventsCog(commands.Cog):
     async def _on_signup(self, interaction: discord.Interaction, view: EventMessageView):
         await self.signup_repo.add(view.event_name, interaction.user.id)
 
-        # Pull the latest start_time from DB to respect edits
         row = await _get_event_row(settings.SQLITE_PATH, view.event_name, view.channel_id)
         if row:
             start_iso = row[4]
@@ -374,7 +587,7 @@ class EventsCog(commands.Cog):
             if event_start.tzinfo is None:
                 event_start = event_start.replace(tzinfo=datetime.timezone.utc)
         else:
-            event_start = view.event_start  # fallback
+            event_start = view.event_start
 
         now = datetime.datetime.now(datetime.timezone.utc)
         reminder_time = event_start - datetime.timedelta(minutes=15)
@@ -387,7 +600,6 @@ class EventsCog(commands.Cog):
                 args=[self.bot, interaction.user.id, view.event_name, event_start]
             )
         else:
-            # inside 15m window or after start -> DM immediately
             try:
                 user = await self.bot.fetch_user(interaction.user.id)
                 if user:
@@ -400,16 +612,11 @@ class EventsCog(commands.Cog):
         await self._update_event_message(view.event_name, view.channel_id, view.message_id)
 
     async def _on_signout(self, interaction: discord.Interaction, view: EventMessageView):
-        # remove from roster
         await self.signup_repo.remove(view.event_name, interaction.user.id)
-
-        # cancel the T-15 reminder if it was scheduled
         try:
             scheduler.remove_job(f"reminder:{interaction.user.id}:{view.event_name}")
         except Exception:
             pass
-
-        # update the event message roster
         await interaction.response.defer()
         await self._update_event_message(view.event_name, view.channel_id, view.message_id)
 
@@ -418,7 +625,6 @@ class EventsCog(commands.Cog):
         if ch:
             await ch.send(f"📢 **Event '{name}'** has started!")
 
-        # DM all signed-up users “starting now”
         try:
             user_ids = await self.signup_repo.list_names(name)
             for uid in user_ids:
@@ -431,7 +637,6 @@ class EventsCog(commands.Cog):
         except Exception:
             pass
 
-        # Ensure a session exists (may be missing after reboot)
         sess = active_sessions.get((name, channel_id))
         if not sess:
             row = await _get_event_row(settings.SQLITE_PATH, name, channel_id)
@@ -457,7 +662,6 @@ class EventsCog(commands.Cog):
         ch = self.bot.get_channel(channel_id)
         sess = active_sessions.pop((name, channel_id), None)
 
-        # Pull event window from DB (so Summary has start/end even after reboot)
         row = await _get_event_row(settings.SQLITE_PATH, name, channel_id)
         start_dt = end_dt = None
         if row:
@@ -465,38 +669,31 @@ class EventsCog(commands.Cog):
             start_dt = self._parse_iso_utc(start_iso)
             end_dt = self._parse_iso_utc(end_iso)
 
-        # If caller provided an override (e.g., End Now), honor it
         if end_override_utc:
             end_dt = end_override_utc
 
-        # Let users know we’re finalizing no matter what happens next
         if ch:
             await ch.send(f"✅ **Event '{name}'** has ended. I’m finalizing uploads… (a few minutes)")
 
-        # ✅ Ensure core DB schema exists (events/uploads/signups/etc.) before analytics touch 'uploads'
         try:
             await ensure_tables(settings.SQLITE_PATH)
         except Exception as e:
             if ch:
                 await ch.send(f"⚠️ DB init failed: `{e}`")
 
-        # (optional but helpful) force one last pass to ingest any logs that finished right at the end
         try:
             await process_pending_uploads()
         except Exception:
             pass
 
-        # --- Ensure analytics tables & rows exist BEFORE any summary helper touches them
         try:
             await ensure_enriched_for_event(name)
         except Exception as e:
             if ch:
                 await ch.send(f"⚠️ Analytics bootstrap failed: `{e}`")
 
-        # --- Build and post the event summary
         try:
             if sess:
-                # live session path
                 await sess.stop_task()
                 summary_embed = await build_summary_embed(
                     name,
@@ -505,7 +702,6 @@ class EventsCog(commands.Cog):
                     event_end_utc=end_dt or sess.end,
                 )
             else:
-                # fallback path (post-reboot or no session) - reconstruct from DB
                 results = await self._load_results_for_summary(name)
                 safe_end = end_dt or datetime.datetime.now(datetime.timezone.utc)
                 summary_embed = await build_summary_embed(
@@ -521,7 +717,6 @@ class EventsCog(commands.Cog):
             if ch:
                 await ch.send(f"⚠️ Summary failed: `{e}`")
 
-        # --- Post analytics embeds (optional)
         try:
             embeds = await build_event_analytics_embeds(name)
             if ch and embeds:
@@ -535,8 +730,7 @@ class EventsCog(commands.Cog):
         if interaction.user.id == event_creator_id:
             return True
         try:
-            member = interaction.guild.get_member(interaction.user.id) or await interaction.guild.fetch_member(
-                interaction.user.id)
+            member = interaction.guild.get_member(interaction.user.id) or await interaction.guild.fetch_member(interaction.user.id)
         except discord.NotFound:
             return False
         return bool(member.guild_permissions.administrator)
@@ -552,18 +746,14 @@ class EventsCog(commands.Cog):
             await interaction.response.send_message("You don’t have permission to edit this event.", ephemeral=True)
             return
 
-        # Disallow edits after start
         now = datetime.datetime.now(datetime.timezone.utc)
         start_dt = datetime.datetime.fromisoformat(start_iso)
         if start_dt.tzinfo is None:
             start_dt = start_dt.replace(tzinfo=datetime.timezone.utc)
         if now >= start_dt:
-            await interaction.response.send_message("This event has already started. Use **End Now** or **Cancel**.",
-                                                    ephemeral=True)
+            await interaction.response.send_message("This event has already started. Use **End Now** or **Cancel**.", ephemeral=True)
             return
 
-        # Pre-fill modal with current values
-        # Duration = end - start (best effort)
         try:
             end_dt = datetime.datetime.fromisoformat(end_iso)
             if end_dt.tzinfo is None:
@@ -576,14 +766,12 @@ class EventsCog(commands.Cog):
             dur_str = "1h"
 
         start_str_local = start_dt.astimezone().strftime("%Y-%m-%d %H:%M")
-        await interaction.response.send_modal(
-            EditEventModal(view.event_name, start_str_local, dur_str, self._on_edit_submit))
+        await interaction.response.send_modal(EditEventModal(view.event_name, start_str_local, dur_str, self._on_edit_submit))
 
-    async def _on_edit_submit(self, interaction: discord.Interaction, event_name: str, new_start_str: str,
-                              new_duration_str: str):
+    async def _on_edit_submit(self, interaction: discord.Interaction, event_name: str, new_start_str: str, new_duration_str: str):
         await interaction.response.defer(ephemeral=True)
-        # Compute new start/end (local -> UTC), reschedule jobs, update DB and message embed, replace view
-        def parse_duration(s: str) -> datetime.timedelta | None:
+
+        def _parse_duration(s: str) -> datetime.timedelta | None:
             s = s.lower().replace(" ", "")
             m = re.match(r"(?:(\d+)h)?(?:(\d+)m)?", s)
             if not m:
@@ -598,14 +786,12 @@ class EventsCog(commands.Cog):
         if not row:
             await interaction.response.send_message("Event not found.", ephemeral=True)
             return
-        _, _name, creator_id, channel_id, start_iso_old, end_iso_old, message_id = row
+        _, _name, creator_id, channel_id, _start_iso_old, _end_iso_old, message_id = row
 
-        # Permission (again)
         if not await self._is_owner_or_admin(interaction, creator_id):
             await interaction.response.send_message("You don’t have permission to edit this event.", ephemeral=True)
             return
 
-        # New times
         try:
             naive = datetime.datetime.strptime(new_start_str, "%Y-%m-%d %H:%M")
             local_tz = datetime.datetime.now().astimezone().tzinfo
@@ -614,19 +800,17 @@ class EventsCog(commands.Cog):
             await interaction.response.send_message("Invalid start format. Use `YYYY-MM-DD HH:MM`.", ephemeral=True)
             return
 
-        dur = parse_duration(new_duration_str)
+        dur = _parse_duration(new_duration_str)
         if dur is None:
             await interaction.response.send_message("Invalid duration. Use `2h30m`, `45m`, etc.", ephemeral=True)
             return
         new_end_utc = new_start_utc + dur
 
-        # Update DB
         async with aiosqlite.connect(settings.SQLITE_PATH) as db:
             await db.execute("UPDATE events SET start_time=?, end_time=? WHERE name=? AND channel_id=?",
                              (new_start_utc.isoformat(), new_end_utc.isoformat(), event_name, channel_id))
             await db.commit()
 
-        # Reschedule jobs
         try:
             scheduler.remove_job(f"start:{event_name}:{channel_id}")
         except Exception:
@@ -640,7 +824,6 @@ class EventsCog(commands.Cog):
         scheduler.add_job(self._end_event, 'date', id=f"end:{event_name}:{channel_id}",
                           replace_existing=True, run_date=new_end_utc, args=[event_name, channel_id])
 
-        # Update the event message embed + replace view with new start
         channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
         try:
             message = await channel.fetch_message(message_id)
@@ -668,19 +851,16 @@ class EventsCog(commands.Cog):
             await interaction.response.send_message("You don’t have permission to cancel this event.", ephemeral=True)
             return
 
-        # Remove scheduled jobs
         for jid in (f"start:{view.event_name}:{view.channel_id}", f"end:{view.event_name}:{view.channel_id}"):
             try:
                 scheduler.remove_job(jid)
             except Exception:
                 pass
 
-        # Stop active session if any
         sess = active_sessions.pop((view.event_name, view.channel_id), None)
         if sess:
             await sess.stop_task()
 
-        # Disable signups and mark cancelled
         channel = self.bot.get_channel(view.channel_id) or await self.bot.fetch_channel(view.channel_id)
         try:
             message = await channel.fetch_message(message_id)
@@ -698,27 +878,24 @@ class EventsCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         row = await _get_event_row(settings.SQLITE_PATH, view.event_name, view.channel_id)
         if not row:
-            await interaction.response.send_message("Event not found.", ephemeral=True);
+            await interaction.response.send_message("Event not found.", ephemeral=True)
             return
         _, _name, creator_id, _ch, _s, _e, _msg = row
         if not await self._is_owner_or_admin(interaction, creator_id):
-            await interaction.response.send_message("You don’t have permission to end this event.", ephemeral=True);
+            await interaction.response.send_message("You don’t have permission to end this event.", ephemeral=True)
             return
 
-        # Cancel scheduled end
         try:
             scheduler.remove_job(f"end:{view.event_name}:{view.channel_id}")
         except Exception:
             pass
 
-        # Update DB end_time to now
         end_now = datetime.datetime.now(datetime.timezone.utc)
         async with aiosqlite.connect(settings.SQLITE_PATH) as db:
             await db.execute("UPDATE events SET end_time=? WHERE name=? AND channel_id=?",
                              (end_now.isoformat(), view.event_name, view.channel_id))
             await db.commit()
 
-        # End immediately with correct end time in the summary
         await self._end_event(view.event_name, view.channel_id, end_override_utc=end_now)
         await interaction.followup.send("⏹️ Event ended.", ephemeral=True)
 
@@ -728,7 +905,6 @@ class EventsCog(commands.Cog):
         rows = await upload_repo.list_for_event(name)
         if not rows:
             return
-        # Build a simple boss summary from DB rows
         by_boss = {}
         for r in rows:
             key = (r["boss_id"], r["boss_name"])

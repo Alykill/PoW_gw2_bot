@@ -139,58 +139,42 @@ def _collect_mechanic_counts(
     Return {account -> count} for a given mechanic spec.
 
     Matching:
-      - exact_names (preferred): exact OR substring (robust)
-      - substrings: normalized substring fallback
-    Priority:
-      1) mechanics[*].players / playerHits (EI aggregated)
-      2) mechanics[*].mechanicsData (per hit, dedup across entries using canonical key; optional time tolerance)
-      3) top-level mechanic logs (rare fallback; same dedup)
-    Dedup applies ONLY across different mechanic entries (not within the same entry).
-    """
+      - If exact_names are provided -> STRICT equality on normalized name/shortName/fullName.
+      - Else fall back to normalized substrings (name/shortName/fullName only).
 
-    def _texts(m: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
-        return (
-            str(m.get("name") or ""),
-            str(m.get("shortName") or ""),
-            str(m.get("fullName") or ""),
-            str(m.get("description") or ""),
-            str(m.get("tooltip") or ""),
-        )
+    Priority:
+      1) mechanics[*].mechanicsData (per hit, dedup across *different* mechanic entries)
+      2) mechanics[*].players / playerHits (EI aggregated)  — only if (1) yields nothing
+      3) top-level mechanic logs                           — only if (1) & (2) yield nothing
+    """
 
     def _norm(s: Optional[str]) -> str:
         s = (s or "").lower().strip()
-        # remove non-alphanumerics to tolerate punctuation/spacing variants
         return re.sub(r"[^a-z0-9]+", "", s)
 
-    # Precompute normalized inputs
-    exact_norm = [_norm(x) for x in (exact_names or []) if x]
-    subs_norm  = [_norm(x) for x in (substrings or []) if x]
+    # Normalize match inputs
+    exact_norm: List[str] = [_norm(x) for x in (exact_names or []) if x]
+    subs_norm:  List[str] = [_norm(x) for x in (substrings or []) if x]
 
-    def _match(m: Dict[str, Any]) -> bool:
-        name, short, full, desc, tip = _texts(m)
-        fields = [name, short, full, desc, tip]
-        fields_norm = [_norm(t) for t in fields if t]
-
-        # 1) Exact (normalized) or "exact as substring" fallback
+    def _match_alias_from_mech_entry(m: Dict[str, Any]) -> Optional[str]:
+        """Return the matched token (normalized) or None."""
+        fields = [
+            _norm(m.get("name")),
+            _norm(m.get("shortName")),
+            _norm(m.get("fullName")),
+        ]
+        # 1) strict equality for exact_names
         if exact_norm:
-            for f in fields_norm:
-                for ex in exact_norm:
-                    if f == ex or (ex and ex in f) or (f and f in ex):
-                        return True
+            for ex in exact_norm:
+                if ex and any(f == ex for f in fields if f):
+                    return ex
+        # 2) substring fallback against name-ish fields only
+        for sub in subs_norm:
+            if sub and any(sub in f for f in fields if f):
+                return sub
+        return None
 
-        # 2) Substring candidates (normalized)
-        if subs_norm:
-            for f in fields_norm:
-                for sub in subs_norm:
-                    if sub and sub in f:
-                        return True
-
-        return False
-
-    canon_key = (canonical or (",".join((exact_names or substrings or ["mechanic"])))).strip().lower()
-    per_actor: DefaultDict[str, int] = defaultdict(int)
-
-    # Map character -> account
+    # Build char->account map
     name_to_account: Dict[str, str] = {}
     for pl in (j.get("players") or []):
         if isinstance(pl, dict):
@@ -198,35 +182,10 @@ def _collect_mechanic_counts(
             if ch and acct:
                 name_to_account[str(ch)] = str(acct)
 
-    mechanics = j.get("mechanics") or []
+    canon_key = (canonical or ",".join((exact_names or substrings or ["mechanic"])) ).strip().lower()
+    per_actor: DefaultDict[str, int] = defaultdict(int)
 
-    # ---- 1) Prefer EI aggregated counts ----
-    used_agg = False
-    for m in mechanics:
-        if not isinstance(m, dict) or not _match(m):
-            continue
-        players_list = m.get("players") or m.get("playerHits")  # support both keys
-        if isinstance(players_list, list) and players_list:
-            used_agg = True
-            for rec in players_list:
-                if not isinstance(rec, dict):
-                    continue
-                account = rec.get("account")
-                if not account:
-                    account = name_to_account.get(str(rec.get("name") or rec.get("actor") or ""))
-                if not account:
-                    continue
-                c = rec.get("c", rec.get("count", 1))
-                try:
-                    c = int(c)
-                except Exception:
-                    c = 1
-                if c > 0:
-                    per_actor[str(account)] += c
-    if used_agg:
-        return dict(per_actor)
-
-    # Helper: cross-entry dedup across mechanics entries
+    # Cross-entry dedup (per account + canonical)
     seen_by_actor: Dict[Tuple[str, str], List[Tuple[int, int]]] = defaultdict(list)
 
     def _already_seen(account: str, ms: Optional[int], entry_idx: int) -> bool:
@@ -235,7 +194,7 @@ def _collect_mechanic_counts(
         lst = seen_by_actor[(account, canon_key)]
         for prev_ms, prev_idx in lst:
             if prev_idx == entry_idx:
-                continue  # same entry => don't dedup
+                continue  # do not dedup within the same entry
             if dedup_ms is None:
                 if prev_ms == ms:
                     return True
@@ -249,13 +208,20 @@ def _collect_mechanic_counts(
             return
         seen_by_actor[(account, canon_key)].append((ms, entry_idx))
 
-    # ---- 2) mechanics[*].mechanicsData (per-hit) ----
+    mechanics = j.get("mechanics") or []
+
+    # ---- (1) Prefer per-hit mechanicsData ----
+    per_hit_found = False
     for idx, m in enumerate(mechanics):
-        if not isinstance(m, dict) or not _match(m):
+        if not isinstance(m, dict):
+            continue
+        matched = _match_alias_from_mech_entry(m)
+        if not matched:
             continue
         md = m.get("mechanicsData")
         if not (isinstance(md, list) and md):
             continue
+        per_hit_found = True
         for rec in md:
             if not isinstance(rec, dict):
                 continue
@@ -263,20 +229,48 @@ def _collect_mechanic_counts(
             account = name_to_account.get(str(actor_char)) if actor_char else None
             if not account:
                 continue
+            # EI times can be seconds(float) or ms(int)
             t = rec.get("time")
             try:
-                ms = int(t) if t is not None else None
+                # if it's small -> seconds to ms
+                x = float(t)
+                ms = int(round(x * 1000.0)) if x < 1e5 else int(round(x))
             except Exception:
                 ms = None
             if _already_seen(account, ms, idx):
                 continue
             _mark_seen(account, ms, idx)
-            per_actor[str(account)] += 1
+            per_actor[account] += 1
 
-    if per_actor:
+    if per_hit_found and per_actor:
         return dict(per_actor)
 
-    # ---- 3) Fallback: top-level logs variants ----
+    # ---- (2) Fall back to EI aggregated counts (players/playerHits) ----
+    used_agg = False
+    for m in mechanics:
+        if not isinstance(m, dict):
+            continue
+        if not _match_alias_from_mech_entry(m):
+            continue
+        players_list = m.get("players") or m.get("playerHits")
+        if isinstance(players_list, list) and players_list:
+            used_agg = True
+            for rec in players_list:
+                if not isinstance(rec, dict):
+                    continue
+                account = rec.get("account") or name_to_account.get(str(rec.get("name") or rec.get("actor") or ""))
+                if not account:
+                    continue
+                try:
+                    c = int(rec.get("c", rec.get("count", 1)))
+                except Exception:
+                    c = 1
+                if c > 0:
+                    per_actor[account] += c
+    if used_agg and per_actor:
+        return dict(per_actor)
+
+    # ---- (3) Fallback: top-level logs variants (rare) ----
     log_candidates: List[List[Dict[str, Any]]] = []
     for k in ("mechanicLogs", "mechanicsLogs", "mechanicsLog", "mechanicsEvents", "mechLogs"):
         v = j.get(k)
@@ -293,14 +287,13 @@ def _collect_mechanic_counts(
         for rec in logs:
             if not isinstance(rec, dict):
                 continue
+            # Build a pseudo-mechanic name triple to match strictly
             pseudo = {
                 "name": rec.get("mechanic") or rec.get("name"),
                 "shortName": rec.get("shortName"),
                 "fullName": rec.get("fullName"),
-                "description": rec.get("description"),
-                "tooltip": rec.get("tooltip"),
             }
-            if not _match(pseudo):
+            if not _match_alias_from_mech_entry(pseudo):
                 continue
             actor_char = rec.get("actor") or rec.get("name") or rec.get("source")
             account = name_to_account.get(str(actor_char)) if actor_char else None
@@ -308,16 +301,16 @@ def _collect_mechanic_counts(
                 continue
             t = rec.get("time")
             try:
-                ms = int(t) if t is not None else None
+                x = float(t)
+                ms = int(round(x * 1000.0)) if x < 1e5 else int(round(x))
             except Exception:
                 ms = None
             if _already_seen(account, ms, idx):
                 continue
             _mark_seen(account, ms, idx)
-            per_actor[str(account)] += 1
+            per_actor[account] += 1
 
     return dict(per_actor)
-
 
 # ---------- Payload normalization (permalink/file -> EI dict) ----------
 async def _coerce_payload_to_json(payload: Union[dict, str]) -> Dict[str, Any]:

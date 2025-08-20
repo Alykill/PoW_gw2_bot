@@ -97,13 +97,13 @@ ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
         {"key": "Pizza", "label": "Pizza",
          "exact": ["Pizza", "Cascading Pizza attack"], "modes": ["occurrences", "occurrences"]},
     ],
-    "soulless horror": [
+    "Soulless Horror": [
         {
-            "key": "scythe",
+            "key":   "sh_scythe_hits",
             "label": "Scythed",
-            "exact": ["Scythe", "Spinning Slash"],
-            "modes": ["hits", "hits"],  # count every record
-            "force_per_hit": True  # never fall back to 'players'
+            "exact": ["Scythe"],      # strict match on EI's mechanic name
+            "canonical": "scythe",
+            "dedup_ms": 500           # keep your 500ms window across entries
         },
     ],
     "statue of darkness": [
