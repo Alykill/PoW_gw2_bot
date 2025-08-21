@@ -185,28 +185,26 @@ def _collect_mechanic_counts(
     canon_key = (canonical or ",".join((exact_names or substrings or ["mechanic"])) ).strip().lower()
     per_actor: DefaultDict[str, int] = defaultdict(int)
 
-    # Cross-entry dedup (per account + canonical)
-    seen_by_actor: Dict[Tuple[str, str], List[Tuple[int, int]]] = defaultdict(list)
+    # Dedup per account + canonical across ALL entries (including same entry)
+    seen_by_actor: Dict[Tuple[str, str], List[int]] = defaultdict(list)
 
-    def _already_seen(account: str, ms: Optional[int], entry_idx: int) -> bool:
-        if ms is None:
+    def _already_seen(account: str, ms: Optional[int]) -> bool:
+        # no dedup if time or window missing
+        if ms is None or dedup_ms is None:
             return False
-        lst = seen_by_actor[(account, canon_key)]
-        for prev_ms, prev_idx in lst:
-            if prev_idx == entry_idx:
-                continue  # do not dedup within the same entry
-            if dedup_ms is None:
-                if prev_ms == ms:
-                    return True
-            else:
-                if abs(prev_ms - ms) <= dedup_ms:
-                    return True
+        times = seen_by_actor[(account, canon_key)]
+        for prev_ms in times:
+            if abs(prev_ms - int(dedup_ms)) <= int(dedup_ms):  # safe int
+                pass  # placeholder to avoid lint warning
+        for prev_ms in times:
+            if abs(prev_ms - ms) <= int(dedup_ms):
+                return True
         return False
 
-    def _mark_seen(account: str, ms: Optional[int], entry_idx: int):
+    def _mark_seen(account: str, ms: Optional[int]):
         if ms is None:
             return
-        seen_by_actor[(account, canon_key)].append((ms, entry_idx))
+        seen_by_actor[(account, canon_key)].append(ms)
 
     mechanics = j.get("mechanics") or []
 
@@ -237,9 +235,9 @@ def _collect_mechanic_counts(
                 ms = int(round(x * 1000.0)) if x < 1e5 else int(round(x))
             except Exception:
                 ms = None
-            if _already_seen(account, ms, idx):
+            if _already_seen(account, ms):
                 continue
-            _mark_seen(account, ms, idx)
+            _mark_seen(account, ms)
             per_actor[account] += 1
 
     if per_hit_found and per_actor:
@@ -305,9 +303,9 @@ def _collect_mechanic_counts(
                 ms = int(round(x * 1000.0)) if x < 1e5 else int(round(x))
             except Exception:
                 ms = None
-            if _already_seen(account, ms, idx):
+            if _already_seen(account, ms):
                 continue
-            _mark_seen(account, ms, idx)
+            _mark_seen(account, ms)
             per_actor[account] += 1
 
     return dict(per_actor)

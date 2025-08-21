@@ -63,9 +63,18 @@ ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
     #     {"key": "Boss TP", "label": "Blue ports",
     #      "exact": ["Boss TP", "Boss Teleport"], "modes": ["occurrences", "occurrences"]},
     # ],
+    # "gorseval the multifarious": [
+    #     {"key": "Egg", "label": "Eggs",
+    #      "exact": ["Egg", "Egged"], "modes": ["occurrences", "occurrences"]},
+    # ],
     "gorseval the multifarious": [
-        {"key": "Egg", "label": "Eggs",
-         "exact": ["Egg", "Egged"], "modes": ["occurrences", "occurrences"]},
+        {
+            "key": "Egg",
+            "label": "Eggs",
+            "exact": ["Egg", "Egged"],
+            "modes": ["occurrences", "occurrences"],
+            "dedup_ms": 500,   # <- add this
+        },
     ],
     "slothasor": [
         {"key": "Tantrum", "label": "Circle KD",
@@ -90,12 +99,20 @@ ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
          "exact": ["Schk.Wv", "Shockwave from Spears"], "modes": ["occurrences", "occurrences"]},
     ],
     "deimos": [
-        {"key": "Oil T.", "label": "Oil Trigger",                # ONLY the Oil Trigger
-         "exact": ["Oil T."], "modes": ["occurrences"]},
-        {"key": "black_oil_trigger", "label": "Black Oil Trigger",  # separate from Oil T.
-         "exact": ["Black Oil Trigger"], "modes": ["occurrences"]},
-        {"key": "Pizza", "label": "Pizza",
-         "exact": ["Pizza", "Cascading Pizza attack"], "modes": ["occurrences", "occurrences"]},
+        {
+            "key": "Oil T.",
+            "label": "Oil Trigger",
+            "exact": ["Oil T.", "Oil Trigger"],
+            "force_per_hit": True,
+            "dedup_ms": 500,   # collapse multi-pulse records into one occurrence
+        },
+        {
+            "key": "Pizza",
+            "label": "Pizza",
+            "exact": ["Pizza", "Cascading Pizza attack"],
+            "force_per_hit": True,
+            "dedup_ms": 500,   # collapse the pizza’s rapid ticks
+        },
     ],
     "Soulless Horror": [
         {
@@ -111,8 +128,13 @@ ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
          "exact": ["Hard CC Judge", "CC Judge"], "modes": ["occurrences", "occurrences"]},
     ],
     "dhuum": [
-        {"key": "dhuum_dip", "label": "Dip AoE",
-         "exact": ["Dip", "Dip AoE"], "canonical": "dhuum_dip", "dedup_ms": 5000},
+        {
+            "key": "dhuum_dip",
+            "label": "Dip AoE",
+            "exact": ["Dip", "Dip AoE"],
+            "force_per_hit": True,
+            "dedup_ms": 10000,   # collapse multi-pulse records into one occurrence
+        },
         {"key": "crack", "label": "Stood in Cracks",
          "exact": ["Crack", "Cull (Fearing Fissure)"], "modes": ["occurrences", "occurrences"]},
         {"key": "rending_swipe_hit", "label": "Swiped",
@@ -122,11 +144,25 @@ ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
         {"key": "arm_slam", "label": "Arm Slammed",  # do NOT match 'Tremor'
          "exact": ["Arm Slam", "Arm Slam: Pulverize"], "modes": ["occurrences", "occurrences"]},
     ],
+    # "twin largos": [
+    #     {"key": "steal", "label": "Boon Steal",
+    #     "exact": ["Steal", "Boon Steal"], "modes": ["occurrences"]},
+    # ],
     "twin largos": [
-        {"key": "float", "label": "Bubbled",
-        "exact": ["Float", "Float Bubble"], "modes": ["occurrences", "occurrences"], "dedup_ms": 2500},
-        {"key": "steal", "label": "Boon Steal",
-        "exact": ["Steal", "Boon Steal"], "modes": ["occurrences"]},
+            {
+                "key": "float",
+                "label": "Bubbled",
+                "exact": ["Flt"],
+                "force_per_hit": True,
+                "dedup_ms": 1000,   # collapse multi-pulse records into one occurrence
+            },
+            {
+                "key": "steal",
+                "label": "Boon Steal",
+                "exact": ["Steal", "Boon Steal"],
+                "force_per_hit": False,
+                "dedup_ms": 1000,   # collapse multi-pulse records into one occurrence
+            },
     ],
     "qadim": [
         {"key": "qadim_hitbox_aoe", "label": "Stood in Qadim hitbox",
@@ -143,16 +179,30 @@ ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
          "exact": ["Pushed", "Pushed by rotating breakbar"], "modes": ["occurrences", "occurrences"]},
     ],
     "qadim the peerless": [
-        {"key": "qtp_knckpll", "label": "Knocked Back/Pulled",
-         "exact": ["Knck.Pll", "Knocked Back/Pulled"], "modes": ["occurrences", "occurrences"]},
+        # {"key": "qtp_knckpll", "label": "Knocked Back/Pulled",
+        #  "exact": ["Knck.Pll", "Knocked Back/Pulled"], "modes": ["occurrences", "occurrences"]},
         {"key": "qtp_lightning", "label": "Hit by Expanding Lightning",
          "exact": ["Lght.H", "Lightning Hit"], "modes": ["occurrences", "occurrences"]},
-        {"key": "qtp_small_lightning", "label": "Hit by Small Lightning",
-         "exact": ["S.Lght.H", "Small Lightning Hit"], "modes": ["occurrences", "occurrences"]},
-        {"key": "qtp_magma", "label": "Stood in Magma Field",
-         "exact": ["Magma.F", "Magma Field"], "modes": ["occurrences", "occurrences"]},
-        {"key": "qtp_small_magma", "label": "Stood in Lightning fire puddle",
-         "exact": ["S.Magma.F", "Small Magma Field"], "modes": ["occurrences", "occurrences"]},
+        # {"key": "qtp_small_lightning", "label": "Hit by Small Lightning",
+        #  "exact": ["S.Lght.H", "Small Lightning Hit"], "modes": ["occurrences", "occurrences"]},
+        {
+            "key": "magma_field",
+            "label": "Stood in Magma Field",
+            "exact": ["Magma.F", "Magma Field"],
+            #"force_per_hit": True,
+            "dedup_ms": 5000,
+        },
+        # {"key": "qtp_magma", "label": "Stood in Magma Field",
+        #  "exact": ["Magma.F", "Magma Field"], "modes": ["occurrences", "occurrences"]},
+        # {"key": "qtp_small_magma", "label": "Stood in Lightning fire puddle",
+        #  "exact": ["S.Magma.F", "Small Magma Field"], "modes": ["occurrences", "occurrences"]},
+        {
+            "key": "qtp_small_magma",
+            "label": "Stood in Lightning fire puddle",
+            "exact": ["S.Magma.F"],
+            #"force_per_hit": True,
+            "dedup_ms": 1000,
+        },
         {"key": "pylon_magma", "label": "Stood in Pylon fire",
          "exact": ["P.Magma", "Pylon Magma"], "modes": ["occurrences", "occurrences"]},
         {"key": "dome_knockback", "label": "Pylon knockback",
