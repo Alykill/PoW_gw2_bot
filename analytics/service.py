@@ -128,12 +128,77 @@ def _player_boss_dps(p: Dict[str, Any]) -> float:
 
 from typing import Optional, Tuple
 
+# ---------- NEW: default coalescing window (used by your helpers below) ----------
+COALESCE_DEFAULT_MS = int(os.getenv("MECH_COALESCE_MS", "1000"))
+
+def _coalesce_ms_for(mech_cfg: Dict[str, Any]) -> int:
+    """
+    Registry may include 'coalesce_ms'. If missing, fall back to COALESCE_DEFAULT_MS.
+    """
+    try:
+        return int(mech_cfg.get("coalesce_ms", COALESCE_DEFAULT_MS))
+    except Exception:
+        return COALESCE_DEFAULT_MS
+
+def _collect_mechanic_actor_times(ei_json: Dict[str, Any],
+                                  mech_idx: int,
+                                  mech_def: Dict[str, Any]) -> Dict[str, List[int]]:
+    """
+    Returns {actor -> sorted [times_ms, ...]} for the mechanic.
+    Supports both EI JSON layouts:
+      A) mechanic definition contains mechanicsData: [{time, actor}, ...]
+      B) global mechanicsData with per-actor blocks referencing 'mechanic' = index
+    """
+    out: Dict[str, List[int]] = {}
+
+    md = mech_def.get("mechanicsData")
+    if isinstance(md, list):  # Layout A
+        for e in md:
+            actor = e.get("actor")
+            t = e.get("time")
+            if actor and isinstance(t, (int, float)):
+                out.setdefault(actor, []).append(int(t))
+        for a in out:
+            out[a].sort()
+        return out
+
+    # Layout B
+    for entry in ei_json.get("mechanicsData", []):
+        actor = entry.get("actor")
+        if not actor:
+            continue
+        for ev in entry.get("mechanics", []):
+            if ev.get("mechanic") == mech_idx:
+                t = ev.get("time")
+                if isinstance(t, (int, float)):
+                    out.setdefault(actor, []).append(int(t))
+    for a in out:
+        out[a].sort()
+    return out
+
+def _collapse_occurrences(times_ms: List[int], gap_ms: int) -> int:
+    """
+    Collapse raw hit timestamps into EI-style occurrences by merging consecutive hits
+    whose gap <= gap_ms. Returns the number of collapsed occurrences.
+    """
+    if not times_ms:
+        return 0
+    occ = 1
+    prev = times_ms[0]
+    for t in times_ms[1:]:
+        if t - prev > gap_ms:
+            occ += 1
+        prev = t
+    return occ
+
+# ---------- (existing) generic collector ----------
 def _collect_mechanic_counts(
     j: Dict[str, Any],
     substrings: List[str],
     exact_names: Optional[List[str]] = None,
     canonical: Optional[str] = None,
     dedup_ms: Optional[int] = None,
+    COALESCE_DEFAULT_MS = int(os.getenv("MECH_COALESCE_MS", "1000"))
 ) -> Dict[str, int]:
     """
     Return {account -> count} for a given mechanic spec.
@@ -194,8 +259,8 @@ def _collect_mechanic_counts(
             return False
         times = seen_by_actor[(account, canon_key)]
         for prev_ms in times:
-            if abs(prev_ms - int(dedup_ms)) <= int(dedup_ms):  # safe int
-                pass  # placeholder to avoid lint warning
+            if abs(prev_ms - int(dedup_ms)) <= int(dedup_ms):  # placeholder kept for compatibility
+                pass
         for prev_ms in times:
             if abs(prev_ms - ms) <= int(dedup_ms):
                 return True
@@ -291,8 +356,21 @@ def _collect_mechanic_counts(
                 "shortName": rec.get("shortName"),
                 "fullName": rec.get("fullName"),
             }
-            if not _match_alias_from_mech_entry(pseudo):
+            # reuse the matcher from above
+            def _norm(s: Optional[str]) -> str:
+                s = (s or "").lower().strip()
+                return re.sub(r"[^a-z0-9]+", "", s)
+            fields = [_norm(pseudo.get("name")), _norm(pseudo.get("shortName")), _norm(pseudo.get("fullName"))]
+            hit = False
+            exact_norm: List[str] = [_norm(x) for x in (exact_names or []) if x]
+            subs_norm:  List[str] = [_norm(x) for x in (substrings or []) if x]
+            if exact_norm:
+                hit = any(ex == f for ex in exact_norm for f in fields if f)
+            if not hit:
+                hit = any(sub and any(sub in f for f in fields if f) for sub in subs_norm)
+            if not hit:
                 continue
+
             actor_char = rec.get("actor") or rec.get("name") or rec.get("source")
             account = name_to_account.get(str(actor_char)) if actor_char else None
             if not account:
@@ -309,6 +387,45 @@ def _collect_mechanic_counts(
             per_actor[account] += 1
 
     return dict(per_actor)
+
+# ---------- NEW: name matcher + collapsed collector ----------
+def _match_mech_names(mech_def: Dict[str, Any], exact_names: Optional[List[str]], substrings: Optional[List[str]]) -> bool:
+    """True if mech_def matches by exact name/shortName/fullName or (fallback) substring."""
+    def _norm(s: Optional[str]) -> str:
+        s = (s or "").lower().strip()
+        return re.sub(r"[^a-z0-9]+", "", s)
+    fields = {_norm(mech_def.get("name")), _norm(mech_def.get("shortName")), _norm(mech_def.get("fullName"))}
+    if exact_names:
+        exact_norm = {_norm(x) for x in exact_names if x}
+        if any(f in exact_norm for f in fields if f):
+            return True
+    if substrings:
+        subs_norm = [_norm(x) for x in substrings if x]
+        if any(sub and any(sub in f for f in fields if f) for sub in subs_norm):
+            return True
+    return False
+
+def _collect_mechanic_counts_collapsed(ei_json: Dict[str, Any],
+                                       exact_names: Optional[List[str]],
+                                       substrings: Optional[List[str]],
+                                       gap_ms: int) -> Dict[str, int]:
+    """
+    EI-style occurrences: find matching mechanics, collect per-actor times, collapse by gap_ms.
+    If multiple mechanic entries match, sums occurrences per actor across them.
+    """
+    mechanics = ei_json.get("mechanics") or []
+    per_actor_total: DefaultDict[str, int] = defaultdict(int)
+
+    for mech_idx, mech_def in enumerate(mechanics):
+        if not isinstance(mech_def, dict):
+            continue
+        if not _match_mech_names(mech_def, exact_names, substrings):
+            continue
+        per_actor_times = _collect_mechanic_actor_times(ei_json, mech_idx, mech_def)
+        for actor, times in per_actor_times.items():
+            per_actor_total[actor] += _collapse_occurrences(times, gap_ms)
+
+    return dict(per_actor_total)
 
 # ---------- Payload normalization (permalink/file -> EI dict) ----------
 async def _coerce_payload_to_json(payload: Union[dict, str]) -> Dict[str, Any]:
@@ -431,13 +548,23 @@ async def enrich_upload(upload_id: int, payload: Union[dict, str]):
     for key, specs in ENCOUNTER_MECHANICS.items():
         if _boss_key_matches(b_name, key):
             for spec in specs:
-                counts = _collect_mechanic_counts(
-                    upload_json,
-                    substrings=spec.get("match", []),
-                    exact_names=spec.get("exact"),
-                    canonical=spec.get("canonical"),
-                    dedup_ms=spec.get("dedup_ms"),
-                )
+                # NEW: if spec specifies coalesced occurrences, use EI-style collapsed logic
+                if "coalesce_ms" in spec:
+                    counts = _collect_mechanic_counts_collapsed(
+                        upload_json,
+                        exact_names=spec.get("exact"),
+                        substrings=spec.get("match", []),
+                        gap_ms=_coalesce_ms_for(spec),
+                    )
+                else:
+                    # Legacy path (unchanged)
+                    counts = _collect_mechanic_counts(
+                        upload_json,
+                        substrings=spec.get("match", []),
+                        exact_names=spec.get("exact"),
+                        canonical=spec.get("canonical"),
+                        dedup_ms=spec.get("dedup_ms"),
+                    )
                 for actor, cnt in counts.items():
                     rows.append((upload_id, actor, spec["key"], float(cnt)))
 

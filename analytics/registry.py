@@ -1,6 +1,16 @@
 # analytics/registry.py
 from typing import Dict, List
 
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTES:
+# - For EI-style “collapsed occurrences” (matching the permalink UI), add
+#   `"coalesce_ms": <int>` to a mechanic entry. service.py will use the new
+#   collapsed counter.
+# - For legacy per-hit counting with a small merge window, keep `"dedup_ms"`.
+# - Fields kept for backward-compatibility: "modes", "force_per_hit".
+#   (They aren’t required by service.py, but left intact if you use them elsewhere.)
+# ─────────────────────────────────────────────────────────────────────────────
+
 GLOBAL_PLAYER_METRICS = [
     ("downs",       "Times downed"),
     ("deaths",      "Times died"),
@@ -57,47 +67,74 @@ ENCOUNTER_WINGS_BY_NAME = {
     "ura": "W8",
 }
 
-# IMPORTANT: enrichment should match mechanics by exact (normalized) alias, not substring.
+# IMPORTANT: enrichment matches mechanics by exact (normalized) alias, not substring.
 ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
-    # "vale guardian": [
-    #     {"key": "Boss TP", "label": "Blue ports",
-    #      "exact": ["Boss TP", "Boss Teleport"], "modes": ["occurrences", "occurrences"]},
-    # ],
-    # "gorseval the multifarious": [
-    #     {"key": "Egg", "label": "Eggs",
-    #      "exact": ["Egg", "Egged"], "modes": ["occurrences", "occurrences"]},
-    # ],
+    # ── Wing 1
     "gorseval the multifarious": [
         {
             "key": "Egg",
             "label": "Eggs",
             "exact": ["Egg", "Egged"],
-            "modes": ["occurrences", "occurrences"],
-            "dedup_ms": 500,   # <- add this
+            "modes": ["occurrences"],
+            "dedup_ms": 500,   # merge rapid multi-pulses
         },
     ],
+
     "slothasor": [
-        {"key": "Tantrum", "label": "Circle KD",
-         "exact": ["Tantrum", "Tripple Circles"], "modes": ["occurrences", "hits"]},
+        {
+            "key": "Tantrum",
+            "label": "Circle KD",
+            "exact": ["Tantrum", "Tripple Circles"],
+            "modes": ["occurrences", "hits"],
+        },
     ],
+
     "matthias gabrel": [
-        {"key": "Spirit", "label": "Touched Spirit",
-         "exact": ["Spirit", "Spirit hit"], "modes": ["occurrences", "occurrences"]},
+        {
+            "key": "Spirit",
+            "label": "Touched Spirit",
+            "exact": ["Spirit", "Spirit hit"],
+            "modes": ["occurrences"],
+        },
     ],
+
     "keep construct": [
-        {"key": "bad_white_orb", "label": "Wrong orb collected - white",
-         "exact": ["BW.Orb", "Bad White Orb"], "modes": ["occurrences", "occurrences"]},
-        {"key": "bad_red_orb", "label": "Wrong orb collected - red",
-         "exact": ["BR.Orb", "Bad Red Orb"], "modes": ["occurrences", "occurrences"]},
+        {
+            "key": "bad_white_orb",
+            "label": "Wrong orb collected - white",
+            "exact": ["BW.Orb", "Bad White Orb"],
+            "modes": ["occurrences"],
+        },
+        {
+            "key": "bad_red_orb",
+            "label": "Wrong orb collected - red",
+            "exact": ["BR.Orb", "Bad Red Orb"],
+            "modes": ["occurrences"],
+        },
     ],
+
     "samarog": [
-        {"key": "sweep", "label": "Swept",
-         "exact": ["Swp", "Prisoner Sweep"], "modes": ["occurrences", "occurrences"]},
-        {"key": "spear return", "label": "Returning Spears",
-         "exact": ["S.Rt", "Spear Return"], "modes": ["occurrences", "occurrences"]},
-        {"key": "shockwave_from_spears", "label": "Shockwaved",
-         "exact": ["Schk.Wv", "Shockwave from Spears"], "modes": ["occurrences", "occurrences"]},
+        {
+            "key": "sweep",
+            "label": "Swept",
+            "exact": ["Swp", "Prisoner Sweep"],
+            "modes": ["occurrences"],
+        },
+        {
+            "key": "spear return",
+            "label": "Returning Spears",
+            "exact": ["S.Rt", "Spear Return"],
+            "modes": ["occurrences"],
+        },
+        {
+            "key": "shockwave_from_spears",
+            "label": "Shockwaved",
+            "exact": ["Schk.Wv", "Shockwave from Spears"],
+            "modes": ["occurrences"],
+        },
     ],
+
+    # ── Wing 4
     "deimos": [
         {
             "key": "Oil T.",
@@ -114,19 +151,27 @@ ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
             "dedup_ms": 500,   # collapse the pizza’s rapid ticks
         },
     ],
+
+    # (Key name is case-insensitive in service; leave as-is if you prefer)
     "Soulless Horror": [
         {
             "key":   "sh_scythe_hits",
             "label": "Scythed",
             "exact": ["Scythe"],      # strict match on EI's mechanic name
             "canonical": "scythe",
-            "dedup_ms": 500           # keep your 500ms window across entries
+            "dedup_ms": 500,
         },
     ],
+
     "statue of darkness": [
-        {"key": "hard_cc_judge", "label": "CC'ed",
-         "exact": ["Hard CC Judge", "CC Judge"], "modes": ["occurrences", "occurrences"]},
+        {
+            "key": "hard_cc_judge",
+            "label": "CC'ed",
+            "exact": ["Hard CC Judge", "CC Judge"],
+            "modes": ["occurrences"],
+        },
     ],
+
     "dhuum": [
         {
             "key": "dhuum_dip",
@@ -135,77 +180,113 @@ ENCOUNTER_MECHANICS: Dict[str, List[Dict]] = {
             "force_per_hit": True,
             "dedup_ms": 10000,   # collapse multi-pulse records into one occurrence
         },
-        {"key": "crack", "label": "Stood in Cracks",
-         "exact": ["Crack", "Cull (Fearing Fissure)"], "modes": ["occurrences", "occurrences"]},
-        {"key": "rending_swipe_hit", "label": "Swiped",
-         "exact": ["Enf.Swipe", "Rending Swipe Hit"], "modes": ["occurrences", "occurrences"]},
-    ],
-    "conjured amalgamate": [
-        {"key": "arm_slam", "label": "Arm Slammed",  # do NOT match 'Tremor'
-         "exact": ["Arm Slam", "Arm Slam: Pulverize"], "modes": ["occurrences", "occurrences"]},
-    ],
-    # "twin largos": [
-    #     {"key": "steal", "label": "Boon Steal",
-    #     "exact": ["Steal", "Boon Steal"], "modes": ["occurrences"]},
-    # ],
-    "twin largos": [
-            {
-                "key": "float",
-                "label": "Bubbled",
-                "exact": ["Flt"],
-                "force_per_hit": True,
-                "dedup_ms": 1000,   # collapse multi-pulse records into one occurrence
-            },
-            {
-                "key": "steal",
-                "label": "Boon Steal",
-                "exact": ["Steal", "Boon Steal"],
-                "force_per_hit": False,
-                "dedup_ms": 1000,   # collapse multi-pulse records into one occurrence
-            },
-    ],
-    "qadim": [
-        {"key": "qadim_hitbox_aoe", "label": "Stood in Qadim hitbox",
-         "exact": ["Q.Hitbox", "Qadim Hitbox AoE"], "modes": ["occurrences", "occurrences"]},
-    ],
-    "cardinal adina": [
-        {"key": "radiant_blindness", "label": "Blinded",
-         "exact": ["R.Blind", "Radiant Blindness"], "modes": ["occurrences", "occurrences"]},
-    ],
-    "cardinal sabir": [
-        {"key": "shockwave", "label": "Shockwaved",
-         "exact": ["Shockwave", "Shockwave Hit"], "modes": ["occurrences", "occurrences"]},
-        {"key": "pushed", "label": "Pushed during CC",
-         "exact": ["Pushed", "Pushed by rotating breakbar"], "modes": ["occurrences", "occurrences"]},
-    ],
-    "qadim the peerless": [
-        # {"key": "qtp_knckpll", "label": "Knocked Back/Pulled",
-        #  "exact": ["Knck.Pll", "Knocked Back/Pulled"], "modes": ["occurrences", "occurrences"]},
-        {"key": "qtp_lightning", "label": "Hit by Expanding Lightning",
-         "exact": ["Lght.H", "Lightning Hit"], "modes": ["occurrences", "occurrences"]},
-        # {"key": "qtp_small_lightning", "label": "Hit by Small Lightning",
-        #  "exact": ["S.Lght.H", "Small Lightning Hit"], "modes": ["occurrences", "occurrences"]},
         {
-            "key": "magma_field",
-            "label": "Stood in Magma Field",
-            "exact": ["Magma.F", "Magma Field"],
-            #"force_per_hit": True,
-            "dedup_ms": 5000,
+            "key": "crack",
+            "label": "Stood in Cracks",
+            "exact": ["Crack", "Cull (Fearing Fissure)"],
+            "modes": ["occurrences"],
         },
-        # {"key": "qtp_magma", "label": "Stood in Magma Field",
-        #  "exact": ["Magma.F", "Magma Field"], "modes": ["occurrences", "occurrences"]},
-        # {"key": "qtp_small_magma", "label": "Stood in Lightning fire puddle",
-        #  "exact": ["S.Magma.F", "Small Magma Field"], "modes": ["occurrences", "occurrences"]},
         {
-            "key": "qtp_small_magma",
-            "label": "Stood in Lightning fire puddle",
-            "exact": ["S.Magma.F"],
-            #"force_per_hit": True,
+            "key": "rending_swipe_hit",
+            "label": "Swiped",
+            "exact": ["Enf.Swipe", "Rending Swipe Hit"],
+            "modes": ["occurrences"],
+        },
+    ],
+
+    # ── Wing 6
+    "conjured amalgamate": [
+        {
+            "key": "arm_slam",
+            "label": "Arm Slammed",  # do NOT match 'Tremor'
+            "exact": ["Arm Slam", "Arm Slam: Pulverize"],
+            "modes": ["occurrences"],
+        },
+    ],
+
+    "twin largos": [
+        {
+            "key": "float",
+            "label": "Bubbled",
+            "exact": ["Flt"],
+            "force_per_hit": True,
+            "dedup_ms": 1000,   # collapse multi-pulse records into one occurrence
+        },
+        {
+            "key": "steal",
+            "label": "Boon Steal",
+            "exact": ["Steal", "Boon Steal"],
+            "force_per_hit": False,
             "dedup_ms": 1000,
         },
-        {"key": "pylon_magma", "label": "Stood in Pylon fire",
-         "exact": ["P.Magma", "Pylon Magma"], "modes": ["occurrences", "occurrences"]},
-        {"key": "dome_knockback", "label": "Pylon knockback",
-         "exact": ["Dome.KB", "Dome Knockback"], "modes": ["occurrences", "occurrences"]},
+    ],
+
+    "qadim": [
+        {
+            "key": "qadim_hitbox_aoe",
+            "label": "Stood in Qadim hitbox",
+            "exact": ["Q.Hitbox", "Qadim Hitbox AoE"],
+            "modes": ["occurrences"],
+        },
+    ],
+
+    # ── Wing 7
+    "cardinal adina": [
+        {
+            "key": "radiant_blindness",
+            "label": "Blinded",
+            "exact": ["R.Blind", "Radiant Blindness"],
+            "modes": ["occurrences"],
+        },
+    ],
+
+    "cardinal sabir": [
+        {
+            "key": "shockwave",
+            "label": "Shockwaved",
+            "exact": ["Shockwave", "Shockwave Hit"],
+            "modes": ["occurrences"],
+        },
+        {
+            "key": "pushed",
+            "label": "Pushed during CC",
+            "exact": ["Pushed", "Pushed by rotating breakbar"],
+            "modes": ["occurrences"],
+        },
+    ],
+
+    "qadim the peerless": [
+        {
+            "key": "qtp_lightning",
+            "label": "Hit by Expanding Lightning",
+            "exact": ["Lght.H", "Lightning Hit"],
+            "modes": ["occurrences"],
+        },
+        {
+            "key": "Magma.F",
+            "label": "Stood in magma field",
+            "exact": ["Magma.F"],
+            "modes": ["occurrences"],
+            "coalesce_ms": 1000,  # NEW: true EI-style collapsed occurrences
+        },
+        {
+            "key": "S.Magma.F",
+            "label": "Stood in Lightning fire puddle",
+            "exact": ["S.Magma.F"],
+            "modes": ["occurrences"],
+            "coalesce_ms": 1000,  # NEW: true EI-style collapsed occurrences
+        },
+        {
+            "key": "pylon_magma",
+            "label": "Stood in Pylon fire",
+            "exact": ["P.Magma", "Pylon Magma"],
+            "modes": ["occurrences"],
+        },
+        {
+            "key": "dome_knockback",
+            "label": "Pylon knockback",
+            "exact": ["Dome.KB", "Dome Knockback"],
+            "modes": ["occurrences"],
+        },
     ],
 }
