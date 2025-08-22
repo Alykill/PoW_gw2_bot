@@ -16,6 +16,7 @@ WING_TITLES = {
     "W5": "Wing 5 — Hall of Chains",
     "W6": "Wing 6 — Mythwright Gambit",
     "W7": "Wing 7 — The Key of Ahdashim",
+    "W8": "Wing 8 — Mount Balrior",
     "Other": "Other",
 }
 
@@ -531,7 +532,7 @@ async def build_summary_embed(
     def _remaining_fields() -> int:
         return MAX_FIELDS - len(em.fields)
 
-    wing_order = [f"W{i}" for i in range(1, 8)] + ["Other"]
+    wing_order = [f"W{i}" for i in range(1, 9)] + ["Other"]
     for code in wing_order:
         lines = raw_by_wing.get(code)
         if not lines:

@@ -2,10 +2,10 @@
 import json, urllib.request, time
 from typing import List, Dict, Any, Tuple
 
-URL = "https://dps.report/getJson?permalink=szj7-20250818-094517_qpeer"
+URL = "https://dps.report/getJson?permalink=WFhO-20250818-224530_ura"
 
-TARGET_KEY   = "S.Magma.F"           # shortName / name / fullName
-TARGET_ACTOR = "Lights And Shadows"  # exact actor string as in JSON
+TARGET_KEY   = "Lnch"           # shortName / name / fullName
+TARGET_ACTOR = "Belorns Law"  # exact actor string as in JSON
 COALESCE_MS  = 1000                  # collapse hits within this gap into one "occurrence"
 
 TIMEOUT_S    = 10
